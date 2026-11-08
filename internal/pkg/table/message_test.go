@@ -1,0 +1,1566 @@
+// Copyright (C) 2014 Nippon Telegraph and Telephone Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package table
+
+import (
+	"fmt"
+	"net/netip"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/osrg/gobgp/v4/pkg/config/oc"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// before:
+//
+//	as-path  : 65000, 4000, 400000, 300000, 40001
+//
+// expected result:
+//
+//	as-path  : 65000, 4000, 23456, 23456, 40001
+//	as4-path : 65000, 4000, 400000, 300000, 40001
+func TestAsPathAs2Trans1(t *testing.T) {
+	as := []uint32{65000, 4000, 400000, 300000, 40001}
+	params := []bgp.AsPathParamInterface{bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs2ByteAs(msg)
+	assert.Equal(t, len(msg.PathAttributes), 2)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.AsPathParam).AS), 5)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.AsPathParam).AS[0], uint16(65000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.AsPathParam).AS[1], uint16(4000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.AsPathParam).AS[2], uint16(bgp.AS_TRANS))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.AsPathParam).AS[3], uint16(bgp.AS_TRANS))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.AsPathParam).AS[4], uint16(40001))
+	assert.Equal(t, len(msg.PathAttributes[1].(*bgp.PathAttributeAs4Path).Value), 1)
+	assert.Equal(t, len(msg.PathAttributes[1].(*bgp.PathAttributeAs4Path).Value[0].AS), 5)
+	assert.Equal(t, msg.PathAttributes[1].(*bgp.PathAttributeAs4Path).Value[0].AS[0], uint32(65000))
+	assert.Equal(t, msg.PathAttributes[1].(*bgp.PathAttributeAs4Path).Value[0].AS[1], uint32(4000))
+	assert.Equal(t, msg.PathAttributes[1].(*bgp.PathAttributeAs4Path).Value[0].AS[2], uint32(400000))
+	assert.Equal(t, msg.PathAttributes[1].(*bgp.PathAttributeAs4Path).Value[0].AS[3], uint32(300000))
+	assert.Equal(t, msg.PathAttributes[1].(*bgp.PathAttributeAs4Path).Value[0].AS[4], uint32(40001))
+}
+
+// before:
+//
+//	as-path  : 65000, 4000, 40000, 30000, 40001
+//
+// expected result:
+//
+//	as-path  : 65000, 4000, 40000, 30000, 40001
+func TestAsPathAs2Trans2(t *testing.T) {
+	as := []uint32{65000, 4000, 40000, 30000, 40001}
+	params := []bgp.AsPathParamInterface{bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs2ByteAs(msg)
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.AsPathParam).AS), 5)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.AsPathParam).AS[0], uint16(65000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.AsPathParam).AS[1], uint16(4000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.AsPathParam).AS[2], uint16(40000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.AsPathParam).AS[3], uint16(30000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.AsPathParam).AS[4], uint16(40001))
+}
+
+// before:
+//
+//	as-path  : 65000, 4000, 23456, 23456, 40001
+//	as4-path : 400000, 300000, 40001
+//
+// expected result:
+//
+//	as-path  : 65000, 4000, 400000, 300000, 40001
+func TestAsPathAs4Trans1(t *testing.T) {
+	as := []uint16{65000, 4000, bgp.AS_TRANS, bgp.AS_TRANS, 40001}
+	params := []bgp.AsPathParamInterface{bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	as4 := []uint32{400000, 300000, 40001}
+	param4s := []*bgp.As4PathParam{bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as4)}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath, as4path}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS), 5)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[0], uint32(65000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[1], uint32(4000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[2], uint32(400000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[3], uint32(300000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[4], uint32(40001))
+}
+
+// before:
+//
+//	as-path  : 65000, 4000, {10, 20, 30}, 23456, 23456, 40001
+//	as4-path : 400000, 300000, 40001
+//
+// expected result:
+//
+//	as-path  : 65000, 4000, {10, 20, 30}, 400000, 300000, 40001
+func TestAsPathAs4Trans2(t *testing.T) {
+	as1 := []uint16{65000, 4000}
+	param1 := bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as1)
+	as2 := []uint16{10, 20, 30}
+	param2 := bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SET, as2)
+	as3 := []uint16{bgp.AS_TRANS, bgp.AS_TRANS, 40001}
+	param3 := bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as3)
+	params := []bgp.AsPathParamInterface{param1, param2, param3}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	as4 := []uint32{400000, 300000, 40001}
+	param4s := []*bgp.As4PathParam{bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as4)}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath, as4path}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value), 3)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS), 2)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[0], uint32(65000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[1], uint32(4000))
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[1].(*bgp.As4PathParam).AS), 3)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[1].(*bgp.As4PathParam).AS[0], uint32(10))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[1].(*bgp.As4PathParam).AS[1], uint32(20))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[1].(*bgp.As4PathParam).AS[2], uint32(30))
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[2].(*bgp.As4PathParam).AS), 3)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[2].(*bgp.As4PathParam).AS[0], uint32(400000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[2].(*bgp.As4PathParam).AS[1], uint32(300000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[2].(*bgp.As4PathParam).AS[2], uint32(40001))
+}
+
+// before:
+//
+//	as-path  : 65000, 4000, {10, 20, 30}, 23456, 23456, 40001
+//	as4-path : 3000, 400000, 300000, 40001
+//
+// expected result:
+//
+//	as-path  : 65000, 4000, 3000, 400000, 300000, 40001
+func TestAsPathAs4Trans3(t *testing.T) {
+	as1 := []uint16{65000, 4000}
+	param1 := bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as1)
+	as2 := []uint16{10, 20, 30}
+	param2 := bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SET, as2)
+	as3 := []uint16{bgp.AS_TRANS, bgp.AS_TRANS, 40001}
+	param3 := bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as3)
+	params := []bgp.AsPathParamInterface{param1, param2, param3}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	as4 := []uint32{3000, 400000, 300000, 40001}
+	param4s := []*bgp.As4PathParam{bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as4)}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath, as4path}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS), 6)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[0], uint32(65000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[1], uint32(4000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[2], uint32(3000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[3], uint32(400000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[4], uint32(300000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[5], uint32(40001))
+}
+
+// before:
+//
+//	as-path  : 65000, 4000, 23456, 23456, 40001
+//	as4-path : 400000, 300000, 40001, {10, 20, 30}
+//
+// expected result:
+//
+//	as-path  : 65000, 400000, 300000, 40001, {10, 20, 30}
+func TestAsPathAs4Trans4(t *testing.T) {
+	as := []uint16{65000, 4000, bgp.AS_TRANS, bgp.AS_TRANS, 40001}
+	params := []bgp.AsPathParamInterface{bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	as4 := []uint32{400000, 300000, 40001}
+	as4param1 := bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as4)
+	as5 := []uint32{10, 20, 30}
+	as4param2 := bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SET, as5)
+	param4s := []*bgp.As4PathParam{as4param1, as4param2}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath, as4path}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value), 2)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS), 4)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[0], uint32(65000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[1], uint32(400000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[2], uint32(300000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[3], uint32(40001))
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[1].(*bgp.As4PathParam).AS), 3)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[1].(*bgp.As4PathParam).AS[0], uint32(10))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[1].(*bgp.As4PathParam).AS[1], uint32(20))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[1].(*bgp.As4PathParam).AS[2], uint32(30))
+}
+
+// before:
+//
+//	as-path  : 65000, 4000, 23456, 23456, 40001
+//	as4-path : {10, 20, 30} 400000, 300000, 40001
+//
+// expected result:
+//
+//	as-path  : 65000, {10, 20, 30}, 400000, 300000, 40001
+func TestAsPathAs4Trans5(t *testing.T) {
+	as := []uint16{65000, 4000, bgp.AS_TRANS, bgp.AS_TRANS, 40001}
+	params := []bgp.AsPathParamInterface{bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	as4 := []uint32{400000, 300000, 40001}
+	as4param1 := bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as4)
+	as5 := []uint32{10, 20, 30}
+	as4param2 := bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SET, as5)
+	param4s := []*bgp.As4PathParam{as4param2, as4param1}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath, as4path}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value), 3)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS), 1)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[0], uint32(65000))
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[1].(*bgp.As4PathParam).AS), 3)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[1].(*bgp.As4PathParam).AS[0], uint32(10))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[1].(*bgp.As4PathParam).AS[1], uint32(20))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[1].(*bgp.As4PathParam).AS[2], uint32(30))
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[2].(*bgp.As4PathParam).AS), 3)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[2].(*bgp.As4PathParam).AS[0], uint32(400000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[2].(*bgp.As4PathParam).AS[1], uint32(300000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[2].(*bgp.As4PathParam).AS[2], uint32(40001))
+}
+
+// before:
+//
+//	as-path  : 65000, 4000, 23456, 23456, 40001
+//	as4-path : 100000, 65000, 4000, 400000, 300000, 40001
+//
+// expected result:
+//
+//	as-path  : 65000, 4000, 23456, 23456, 40001
+func TestAsPathAs4TransInvalid1(t *testing.T) {
+	as := []uint16{65000, 4000, bgp.AS_TRANS, bgp.AS_TRANS, 40001}
+	params := []bgp.AsPathParamInterface{bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	as4 := []uint32{100000, 65000, 4000, 400000, 300000, 40001}
+	as4param1 := bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as4)
+	param4s := []*bgp.As4PathParam{as4param1}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath, as4path}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS), 5)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[0], uint32(65000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[1], uint32(4000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[2], uint32(bgp.AS_TRANS))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[3], uint32(bgp.AS_TRANS))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[4], uint32(40001))
+}
+
+// before:
+//
+//	as-path  : 65000, 4000, 23456, 23456, 40001
+//	as4-path : 300000, 40001
+//
+// expected result:
+//
+//	as-path  : 65000, 4000, 23456, 300000, 40001
+func TestAsPathAs4TransInvalid2(t *testing.T) {
+	as := []uint16{65000, 4000, bgp.AS_TRANS, bgp.AS_TRANS, 40001}
+	params := []bgp.AsPathParamInterface{bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	as4 := []uint32{300000, 40001}
+	as4param1 := bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as4)
+	param4s := []*bgp.As4PathParam{as4param1}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath, as4path}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS), 5)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[0], uint32(65000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[1], uint32(4000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[2], uint32(bgp.AS_TRANS))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[3], uint32(300000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[4], uint32(40001))
+}
+
+// before:
+//
+//	as-path  : 65000, 4000, 23456, 23456, 40001
+//	as4-path : nil
+//
+// expected result:
+//
+//	as-path  : 65000, 4000, 23456, 23456, 40001
+func TestAsPathAs4TransInvalid3(t *testing.T) {
+	as := []uint16{65000, 4000, bgp.AS_TRANS, bgp.AS_TRANS, 40001}
+	params := []bgp.AsPathParamInterface{bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS), 5)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[0], uint32(65000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[1], uint32(4000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[2], uint32(bgp.AS_TRANS))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[3], uint32(bgp.AS_TRANS))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[4], uint32(40001))
+}
+
+// before:
+//
+//	as-path  : 65000, 4000, 23456, 23456, 40001
+//	as4-path : empty
+//
+// expected result:
+//
+//	as-path  : 65000, 4000, 23456, 23456, 40001
+func TestAsPathAs4TransInvalid4(t *testing.T) {
+	as := []uint16{65000, 4000, bgp.AS_TRANS, bgp.AS_TRANS, 40001}
+	params := []bgp.AsPathParamInterface{bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	as4 := []uint32{}
+	as4param1 := bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as4)
+	param4s := []*bgp.As4PathParam{as4param1}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath, as4path}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS), 5)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[0], uint32(65000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[1], uint32(4000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[2], uint32(bgp.AS_TRANS))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[3], uint32(bgp.AS_TRANS))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[4], uint32(40001))
+}
+
+// before:
+//
+//	as-path  : {65001, 65002}
+//	as4-path : 400000
+//
+// expected result:
+//
+//	as-path  : 400000
+func TestAsPathAs4TransLeadingSet(t *testing.T) {
+	as := []uint16{65001, 65002}
+	params := []bgp.AsPathParamInterface{bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SET, as)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	as4 := []uint32{400000}
+	param4s := []*bgp.As4PathParam{bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as4)}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath, as4path}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	newParams := msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value
+	assert.Equal(t, len(newParams), 1)
+	assert.Equal(t, newParams[0].GetType(), uint8(bgp.BGP_ASPATH_ATTR_TYPE_SEQ))
+	assert.Equal(t, newParams[0].GetAS(), []uint32{400000})
+}
+
+// before:
+//
+//	as-path  : 23456
+//	as4-path : {400000, 400001}
+//
+// expected result:
+//
+//	as-path  : {400000, 400001}
+func TestAsPathAs4TransAs4LeadingSet(t *testing.T) {
+	as := []uint16{bgp.AS_TRANS}
+	params := []bgp.AsPathParamInterface{bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	as4 := []uint32{400000, 400001}
+	param4s := []*bgp.As4PathParam{bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SET, as4)}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath, as4path}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	newParams := msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value
+	assert.Equal(t, len(newParams), 1)
+	assert.Equal(t, newParams[0].GetType(), uint8(bgp.BGP_ASPATH_ATTR_TYPE_SET))
+	assert.Equal(t, newParams[0].GetAS(), []uint32{400000, 400001})
+}
+
+// before:
+//
+//	as-path  : (65001) 65000, 23456
+//	as4-path : 65000, 400000
+//
+// expected result:
+//
+//	as-path  : (65001) 65000, 400000
+func TestAsPathAs4TransConfed(t *testing.T) {
+	params := []bgp.AsPathParamInterface{
+		bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_CONFED_SEQ, []uint16{65001}),
+		bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, []uint16{65000, bgp.AS_TRANS}),
+	}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	as4 := []uint32{65000, 400000}
+	param4s := []*bgp.As4PathParam{bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as4)}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath, as4path}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	newParams := msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value
+	assert.Equal(t, len(newParams), 2)
+	assert.Equal(t, newParams[0].GetType(), uint8(bgp.BGP_ASPATH_ATTR_TYPE_CONFED_SEQ))
+	assert.Equal(t, newParams[0].GetAS(), []uint32{65001})
+	assert.Equal(t, newParams[1].GetType(), uint8(bgp.BGP_ASPATH_ATTR_TYPE_SEQ))
+	assert.Equal(t, newParams[1].GetAS(), []uint32{65000, 400000})
+}
+
+func TestASPathAs4TransMultipleParams(t *testing.T) {
+	as1 := []uint16{17676, 2914, 174, 50607}
+	as2 := []uint16{bgp.AS_TRANS, bgp.AS_TRANS}
+	params := []bgp.AsPathParamInterface{bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as1), bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as2)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	as41 := []uint32{2914, 174, 50607}
+	as42 := []uint32{198035, 198035}
+	as4param1 := bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as41)
+	as4param2 := bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as42)
+	param4s := []*bgp.As4PathParam{as4param1, as4param2}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath, as4path}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	for _, param := range msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value {
+		p := param.(*bgp.As4PathParam)
+		assert.Equal(t, p.Num, uint8(len(p.AS)))
+	}
+}
+
+func TestASPathAs4TransMultipleLargeParams(t *testing.T) {
+	as1 := make([]uint16, 0, 255)
+	for i := range 255 - 5 {
+		as1 = append(as1, uint16(i+1))
+	}
+	as1 = append(as1, []uint16{17676, 2914, 174, 50607}...)
+	as2 := []uint16{bgp.AS_TRANS, bgp.AS_TRANS}
+	params := []bgp.AsPathParamInterface{bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as1), bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as2)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	as41 := []uint32{2914, 174, 50607}
+	as42 := []uint32{198035, 198035}
+	as4param1 := bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as41)
+	as4param2 := bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as42)
+	param4s := []*bgp.As4PathParam{as4param1, as4param2}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{aspath, as4path}, nil).Body.(*bgp.BGPUpdate)
+	UpdatePathAttrs4ByteAs(logger, msg)
+	for _, param := range msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value {
+		p := param.(*bgp.As4PathParam)
+		assert.Equal(t, p.Num, uint8(len(p.AS)))
+	}
+}
+
+func TestAggregator4BytesASes(t *testing.T) {
+	getAggr := func(msg *bgp.BGPUpdate) *bgp.PathAttributeAggregator {
+		for _, attr := range msg.PathAttributes {
+			switch a := attr.(type) {
+			case *bgp.PathAttributeAggregator:
+				return a
+			}
+		}
+		return nil
+	}
+
+	getAggr4 := func(msg *bgp.BGPUpdate) *bgp.PathAttributeAs4Aggregator {
+		for _, attr := range msg.PathAttributes {
+			switch a := attr.(type) {
+			case *bgp.PathAttributeAs4Aggregator:
+				return a
+			}
+		}
+		return nil
+	}
+
+	addr := netip.MustParseAddr("192.168.0.1")
+	as4 := uint32(100000)
+	as := uint32(1000)
+	attr, _ := bgp.NewPathAttributeAggregator(as4, addr)
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{attr}, nil).Body.(*bgp.BGPUpdate)
+
+	// 4byte capable to 4byte capable for 4 bytes AS
+	UpdatePathAggregator4ByteAs(msg)
+	assert.Equal(t, getAggr(msg).Value.AS, as4)
+	assert.Equal(t, getAggr(msg).Value.Address, addr)
+
+	// 4byte capable to 2byte capable for 4 bytes AS
+	UpdatePathAggregator2ByteAs(msg)
+	assert.Equal(t, getAggr(msg).Value.AS, uint32(bgp.AS_TRANS))
+	assert.Equal(t, getAggr(msg).Value.Askind, reflect.Uint16)
+	assert.Equal(t, getAggr4(msg).Value.AS, as4)
+	assert.Equal(t, getAggr4(msg).Value.Address, addr)
+
+	attr1, _ := bgp.NewPathAttributeAggregator(uint16(bgp.AS_TRANS), addr)
+	attr2, _ := bgp.NewPathAttributeAs4Aggregator(as4, addr)
+	msg = bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{attr1, attr2}, nil).Body.(*bgp.BGPUpdate)
+	assert.Equal(t, getAggr(msg).Value.AS, uint32(bgp.AS_TRANS))
+	assert.Equal(t, getAggr(msg).Value.Askind, reflect.Uint16)
+
+	// non 4byte capable to 4byte capable for 4 bytes AS
+	UpdatePathAggregator4ByteAs(msg)
+	assert.Equal(t, getAggr(msg).Value.AS, as4)
+	assert.Equal(t, getAggr(msg).Value.Askind, reflect.Uint32)
+	assert.Equal(t, getAggr(msg).Value.Address, addr)
+	assert.Equal(t, getAggr4(msg), (*bgp.PathAttributeAs4Aggregator)(nil))
+
+	// non 4byte capable to non 4byte capable for 4 bytes AS
+	UpdatePathAggregator2ByteAs(msg)
+	assert.Equal(t, getAggr(msg).Value.AS, uint32(bgp.AS_TRANS))
+	assert.Equal(t, getAggr(msg).Value.Askind, reflect.Uint16)
+	assert.Equal(t, getAggr4(msg).Value.AS, as4)
+	assert.Equal(t, getAggr4(msg).Value.Address, addr)
+
+	attr, _ = bgp.NewPathAttributeAggregator(as, addr)
+	msg = bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{attr}, nil).Body.(*bgp.BGPUpdate)
+	// 4byte capable to 4byte capable for 2 bytes AS
+	assert.Equal(t, getAggr(msg).Value.AS, as)
+	assert.Equal(t, getAggr(msg).Value.Askind, reflect.Uint32)
+	UpdatePathAggregator4ByteAs(msg)
+	assert.Equal(t, getAggr(msg).Value.AS, as)
+	assert.Equal(t, getAggr(msg).Value.Askind, reflect.Uint32)
+
+	// 4byte capable to non 4byte capable for 2 bytes AS
+	UpdatePathAggregator2ByteAs(msg)
+	assert.Equal(t, getAggr4(msg), (*bgp.PathAttributeAs4Aggregator)(nil))
+	assert.Equal(t, getAggr(msg).Value.Askind, reflect.Uint16)
+	assert.Equal(t, getAggr(msg).Value.AS, as)
+
+	attr, _ = bgp.NewPathAttributeAggregator(uint16(as), addr)
+	msg = bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{attr}, nil).Body.(*bgp.BGPUpdate)
+	// non 4byte capable to 4byte capable for 2 bytes AS
+	assert.Equal(t, getAggr(msg).Value.AS, as)
+	assert.Equal(t, getAggr(msg).Value.Askind, reflect.Uint16)
+	UpdatePathAggregator4ByteAs(msg)
+
+	assert.Equal(t, getAggr(msg).Value.AS, as)
+	assert.Equal(t, getAggr(msg).Value.Askind, reflect.Uint32)
+
+	// non 4byte capable to non 4byte capable for 2 bytes AS
+	UpdatePathAggregator2ByteAs(msg)
+	assert.Equal(t, getAggr(msg).Value.AS, as)
+	assert.Equal(t, getAggr(msg).Value.Askind, reflect.Uint16)
+	assert.Equal(t, getAggr4(msg), (*bgp.PathAttributeAs4Aggregator)(nil))
+}
+
+// AGGREGATOR and AS4_AGGREGATOR from an OLD BGP speaker (RFC 6793
+// Section 4.2.3).
+func TestAggregator4BytesASFromOldSpeaker(t *testing.T) {
+	addr := netip.MustParseAddr("192.168.0.1")
+	as4 := uint32(100000)
+
+	newMsg := func(attrs ...bgp.PathAttributeInterface) *bgp.BGPUpdate {
+		aspath := bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+			bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, []uint16{1000, bgp.AS_TRANS}),
+		})
+		as4path := bgp.NewPathAttributeAs4Path([]*bgp.As4PathParam{
+			bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, []uint32{as4}),
+		})
+		attrs = append([]bgp.PathAttributeInterface{aspath, as4path}, attrs...)
+		return bgp.NewBGPUpdateMessage(nil, attrs, nil).Body.(*bgp.BGPUpdate)
+	}
+	find := func(msg *bgp.BGPUpdate, typ bgp.BGPAttrType) bgp.PathAttributeInterface {
+		for _, attr := range msg.PathAttributes {
+			if attr.GetType() == typ {
+				return attr
+			}
+		}
+		return nil
+	}
+	process := func(msg *bgp.BGPUpdate) {
+		UpdatePathAggregator4ByteAs(msg)
+		UpdatePathAttrs4ByteAs(logger, msg)
+	}
+
+	t.Run("AGGREGATOR is AS_TRANS", func(t *testing.T) {
+		agg, _ := bgp.NewPathAttributeAggregator(uint16(bgp.AS_TRANS), addr)
+		agg4, _ := bgp.NewPathAttributeAs4Aggregator(as4, addr)
+		msg := newMsg(agg, agg4)
+		process(msg)
+
+		a := find(msg, bgp.BGP_ATTR_TYPE_AGGREGATOR).(*bgp.PathAttributeAggregator)
+		assert.Equal(t, as4, a.Value.AS)
+		assert.Nil(t, find(msg, bgp.BGP_ATTR_TYPE_AS4_AGGREGATOR))
+		assert.Nil(t, find(msg, bgp.BGP_ATTR_TYPE_AS4_PATH))
+		p := find(msg, bgp.BGP_ATTR_TYPE_AS_PATH).(*bgp.PathAttributeAsPath)
+		assert.Equal(t, []uint32{1000, as4}, p.Value[0].GetAS())
+	})
+
+	t.Run("AGGREGATOR is not AS_TRANS", func(t *testing.T) {
+		agg, _ := bgp.NewPathAttributeAggregator(uint16(2000), addr)
+		agg4, _ := bgp.NewPathAttributeAs4Aggregator(as4, addr)
+		msg := newMsg(agg, agg4)
+		process(msg)
+
+		// AS4_AGGREGATOR and AS4_PATH are ignored.
+		a := find(msg, bgp.BGP_ATTR_TYPE_AGGREGATOR).(*bgp.PathAttributeAggregator)
+		assert.Equal(t, uint32(2000), a.Value.AS)
+		assert.Nil(t, find(msg, bgp.BGP_ATTR_TYPE_AS4_AGGREGATOR))
+		assert.Nil(t, find(msg, bgp.BGP_ATTR_TYPE_AS4_PATH))
+		p := find(msg, bgp.BGP_ATTR_TYPE_AS_PATH).(*bgp.PathAttributeAsPath)
+		assert.Equal(t, []uint32{1000, bgp.AS_TRANS}, p.Value[0].GetAS())
+	})
+
+	t.Run("AS4_AGGREGATOR without AGGREGATOR", func(t *testing.T) {
+		agg4, _ := bgp.NewPathAttributeAs4Aggregator(as4, addr)
+		msg := newMsg(agg4)
+		process(msg)
+
+		// AS4_AGGREGATOR is dropped and AS4_PATH is still used.
+		assert.Nil(t, find(msg, bgp.BGP_ATTR_TYPE_AGGREGATOR))
+		assert.Nil(t, find(msg, bgp.BGP_ATTR_TYPE_AS4_AGGREGATOR))
+		assert.Nil(t, find(msg, bgp.BGP_ATTR_TYPE_AS4_PATH))
+		p := find(msg, bgp.BGP_ATTR_TYPE_AS_PATH).(*bgp.PathAttributeAsPath)
+		assert.Equal(t, []uint32{1000, as4}, p.Value[0].GetAS())
+	})
+}
+
+func TestBMP(t *testing.T) {
+	aspath1 := []bgp.AsPathParamInterface{
+		bgp.NewAs4PathParam(2, []uint32{1000000}),
+		bgp.NewAs4PathParam(1, []uint32{1000001, 1002}),
+		bgp.NewAs4PathParam(2, []uint32{1003, 100004}),
+	}
+	mp_nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("fe80:1234:1234:5667:8967:af12:8912:1023/100"))
+
+	p := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(3),
+		bgp.NewPathAttributeAsPath(aspath1),
+	}
+	unreach, _ := bgp.NewPathAttributeMpUnreachNLRI(bgp.RF_IPv6_UC, []bgp.PathNLRI{{NLRI: mp_nlri}})
+	p = append(p, unreach)
+	msg := bgp.NewBGPUpdateMessage(nil, p, nil)
+	pList := ProcessMessage(msg, peerR1(), time.Now(), false)
+	CreateUpdateMsgFromPaths(pList)
+}
+
+func unreachIndex(msgs []*bgp.BGPMessage) int {
+	for i := range msgs {
+		for _, a := range msgs[i].Body.(*bgp.BGPUpdate).PathAttributes {
+			if a.GetType() == bgp.BGP_ATTR_TYPE_MP_UNREACH_NLRI {
+				return i
+			}
+		}
+	}
+	// should not be here
+	return -1
+}
+
+func TestMixedMPReachMPUnreach(t *testing.T) {
+	aspath1 := []bgp.AsPathParamInterface{
+		bgp.NewAs4PathParam(2, []uint32{100}),
+	}
+	nlri1, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("2222::/32"))
+	nlri2, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("1111::/32"))
+
+	p := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath(aspath1),
+	}
+	mpreach, _ := bgp.NewPathAttributeMpReachNLRI(bgp.RF_IPv6_UC, []bgp.PathNLRI{{NLRI: nlri1}}, netip.MustParseAddr("1::1"))
+	mpunreach, _ := bgp.NewPathAttributeMpUnreachNLRI(bgp.RF_IPv6_UC, []bgp.PathNLRI{{NLRI: nlri2}})
+	p = append(p, mpreach, mpunreach)
+	msg := bgp.NewBGPUpdateMessage(nil, p, nil)
+	pList := ProcessMessage(msg, peerR1(), time.Now(), false)
+	assert.Equal(t, len(pList), 2)
+	assert.Equal(t, pList[0].IsWithdraw, false)
+	assert.Equal(t, pList[1].IsWithdraw, true)
+	msgs := CreateUpdateMsgFromPaths(pList)
+	assert.Equal(t, len(msgs), 2)
+
+	uIndex := unreachIndex(msgs)
+	rIndex := 0
+	if uIndex == 0 {
+		rIndex = 1
+	}
+	assert.Equal(t, len(msgs[uIndex].Body.(*bgp.BGPUpdate).PathAttributes), 1)
+	assert.Equal(t, len(msgs[rIndex].Body.(*bgp.BGPUpdate).PathAttributes), 3)
+}
+
+func TestMixedNLRIAndMPUnreach(t *testing.T) {
+	aspath1 := []bgp.AsPathParamInterface{
+		bgp.NewAs4PathParam(2, []uint32{100}),
+	}
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	nlri1 := []bgp.PathNLRI{{NLRI: nlri}}
+	nlri2, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("1111::/32"))
+
+	nexthop, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr("1.1.1.1"))
+	p := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath(aspath1),
+		nexthop,
+	}
+	unreach, _ := bgp.NewPathAttributeMpUnreachNLRI(bgp.RF_IPv6_UC, []bgp.PathNLRI{{NLRI: nlri2}})
+	p = append(p, unreach)
+
+	msg := bgp.NewBGPUpdateMessage(nil, p, nlri1)
+	pList := ProcessMessage(msg, peerR1(), time.Now(), false)
+
+	assert.Equal(t, len(pList), 2)
+	assert.Equal(t, pList[0].IsWithdraw, false)
+	assert.Equal(t, pList[1].IsWithdraw, true)
+	msgs := CreateUpdateMsgFromPaths(pList)
+	assert.Equal(t, len(msgs), 2)
+
+	uIndex := unreachIndex(msgs)
+	rIndex := 0
+	if uIndex == 0 {
+		rIndex = 1
+	}
+	assert.Equal(t, len(msgs[uIndex].Body.(*bgp.BGPUpdate).PathAttributes), 1)
+	assert.Equal(t, len(msgs[rIndex].Body.(*bgp.BGPUpdate).PathAttributes), 3)
+}
+
+func TestMergeV4NLRIs(t *testing.T) {
+	aspath1 := []bgp.AsPathParamInterface{
+		bgp.NewAs4PathParam(2, []uint32{100}),
+	}
+	nexthop, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr("1.1.1.1"))
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath(aspath1),
+		nexthop,
+	}
+
+	nr := 1024
+	paths := make([]*Path, 0, nr)
+	addrs := make([]string, 0, nr)
+	for i := range nr {
+		addrs = append(addrs, fmt.Sprintf("1.1.%d.%d", i>>8&0xff, i&0xff))
+		nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix(addrs[i] + "/32"))
+		msg := bgp.NewBGPUpdateMessage(nil, attrs, []bgp.PathNLRI{{NLRI: nlri}})
+		paths = append(paths, ProcessMessage(msg, peerR1(), time.Now(), false)...)
+	}
+	msgs := CreateUpdateMsgFromPaths(paths)
+	assert.Equal(t, len(msgs), 2)
+
+	l := make([]bgp.PathNLRI, 0, nr)
+	for _, msg := range msgs {
+		u := msg.Body.(*bgp.BGPUpdate)
+		assert.Equal(t, len(u.PathAttributes), 3)
+		l = append(l, u.NLRI...)
+	}
+
+	assert.Equal(t, len(l), nr)
+	for i, addr := range addrs {
+		assert.Equal(t, addr, l[i].NLRI.(*bgp.IPAddrPrefix).Prefix.Addr().String())
+	}
+	for _, msg := range msgs {
+		d, _ := msg.Serialize()
+		assert.True(t, len(d) < bgp.BGP_MAX_MESSAGE_LENGTH)
+	}
+}
+
+func TestMergeMPReachNLRIs(t *testing.T) {
+	aspath1 := []bgp.AsPathParamInterface{
+		bgp.NewAs4PathParam(2, []uint32{100}),
+	}
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath(aspath1),
+	}
+
+	nr := 512
+	paths := make([]*Path, 0, nr)
+	for i := range nr {
+		nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix(fmt.Sprintf("2001:db8:%x::/64", i)))
+		mpreach, _ := bgp.NewPathAttributeMpReachNLRI(bgp.RF_IPv6_UC, []bgp.PathNLRI{{NLRI: nlri}}, netip.MustParseAddr("2001:db8::1"))
+		msg := bgp.NewBGPUpdateMessage(nil, append(attrs, mpreach), nil)
+		paths = append(paths, ProcessMessage(msg, peerR1(), time.Now(), false)...)
+	}
+
+	msgs := CreateUpdateMsgFromPaths(paths)
+	assert.Less(t, len(msgs), nr)
+
+	total := 0
+	for _, msg := range msgs {
+		u := msg.Body.(*bgp.BGPUpdate)
+		hasMPReach := false
+		for _, attr := range u.PathAttributes {
+			if a, ok := attr.(*bgp.PathAttributeMpReachNLRI); ok {
+				hasMPReach = true
+				total += len(a.Value)
+			}
+		}
+		assert.True(t, hasMPReach)
+		d, _ := msg.Serialize()
+		assert.LessOrEqual(t, len(d), bgp.BGP_MAX_MESSAGE_LENGTH)
+	}
+
+	assert.Equal(t, nr, total)
+}
+
+func TestMergeMPUnreachNLRIs(t *testing.T) {
+	nr := 512
+	paths := make([]*Path, 0, nr)
+	for i := range nr {
+		nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix(fmt.Sprintf("2001:db8:%x::/64", i)))
+		mpunreach, _ := bgp.NewPathAttributeMpUnreachNLRI(bgp.RF_IPv6_UC, []bgp.PathNLRI{{NLRI: nlri}})
+		msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{mpunreach}, nil)
+		paths = append(paths, ProcessMessage(msg, peerR1(), time.Now(), false)...)
+	}
+
+	msgs := CreateUpdateMsgFromPaths(paths)
+	assert.Less(t, len(msgs), nr)
+
+	total := 0
+	for _, msg := range msgs {
+		u := msg.Body.(*bgp.BGPUpdate)
+		hasMPUnreach := false
+		for _, attr := range u.PathAttributes {
+			if a, ok := attr.(*bgp.PathAttributeMpUnreachNLRI); ok {
+				hasMPUnreach = true
+				total += len(a.Value)
+			}
+		}
+		assert.True(t, hasMPUnreach)
+		d, _ := msg.Serialize()
+		assert.LessOrEqual(t, len(d), bgp.BGP_MAX_MESSAGE_LENGTH)
+	}
+
+	assert.Equal(t, nr, total)
+}
+
+func TestMergeMPReachNLRIsWithAddPath(t *testing.T) {
+	aspath1 := []bgp.AsPathParamInterface{
+		bgp.NewAs4PathParam(2, []uint32{100}),
+	}
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath(aspath1),
+	}
+
+	nr := 256
+	paths := make([]*Path, 0, nr)
+	for i := range nr {
+		nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix(fmt.Sprintf("2001:db8:%x::/64", i)))
+		mpreach, _ := bgp.NewPathAttributeMpReachNLRI(bgp.RF_IPv6_UC, []bgp.PathNLRI{{NLRI: nlri, ID: uint32(i + 1)}}, netip.MustParseAddr("2001:db8::1"))
+		msg := bgp.NewBGPUpdateMessage(nil, append(attrs, mpreach), nil)
+		parsed := ProcessMessage(msg, peerR1(), time.Now(), false)
+		// Assign a local path ID to exercise AddPath serialization.
+		for _, p := range parsed {
+			p.localID = uint32(i + 1)
+		}
+		paths = append(paths, parsed...)
+	}
+
+	options := &bgp.MarshallingOption{
+		AddPath: map[bgp.Family]bgp.BGPAddPathMode{
+			bgp.RF_IPv6_UC: bgp.BGP_ADD_PATH_SEND,
+		},
+	}
+
+	msgs := CreateUpdateMsgFromPaths(paths, options)
+	assert.Less(t, len(msgs), nr)
+
+	total := 0
+	for _, msg := range msgs {
+		u := msg.Body.(*bgp.BGPUpdate)
+		for _, attr := range u.PathAttributes {
+			if a, ok := attr.(*bgp.PathAttributeMpReachNLRI); ok {
+				total += len(a.Value)
+			}
+		}
+		d, err := msg.Serialize(options)
+		assert.NoError(t, err)
+		assert.LessOrEqual(t, len(d), bgp.BGP_MAX_MESSAGE_LENGTH,
+			"serialized UPDATE must not exceed BGP max message length")
+	}
+
+	assert.Equal(t, nr, total, "all NLRIs must be present")
+}
+
+func TestNotMergeMPReachNLRIs(t *testing.T) {
+	paths := make([]*Path, 0, 2)
+
+	aspath1 := []bgp.AsPathParamInterface{
+		bgp.NewAs4PathParam(2, []uint32{100}),
+	}
+
+	// Path 1: nexthop 2001:db8::1
+	nlri1, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("2001:db8::1/128"))
+	mpreach1, _ := bgp.NewPathAttributeMpReachNLRI(bgp.RF_IPv6_UC, []bgp.PathNLRI{{NLRI: nlri1}}, netip.MustParseAddr("2001:db8::1"))
+	attrs1 := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath(aspath1),
+		mpreach1,
+	}
+	paths = append(paths, ProcessMessage(bgp.NewBGPUpdateMessage(nil, attrs1, nil), peerR1(), time.Now(), false)...)
+
+	// Path 2: different nexthop 2001:db8::2
+	nlri2, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("2001:db8::2/128"))
+	mpreach2, _ := bgp.NewPathAttributeMpReachNLRI(bgp.RF_IPv6_UC, []bgp.PathNLRI{{NLRI: nlri2}}, netip.MustParseAddr("2001:db8::2"))
+	attrs2 := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath(aspath1),
+		mpreach2,
+	}
+	paths = append(paths, ProcessMessage(bgp.NewBGPUpdateMessage(nil, attrs2, nil), peerR1(), time.Now(), false)...)
+
+	msgs := CreateUpdateMsgFromPaths(paths)
+	assert.Equal(t, 2, len(msgs), "different nexthops must produce separate UPDATEs")
+
+	// Path 3: same nexthop as path 1 but different community
+	nlri3, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("2001:db8::3/128"))
+	mpreach3, _ := bgp.NewPathAttributeMpReachNLRI(bgp.RF_IPv6_UC, []bgp.PathNLRI{{NLRI: nlri3}}, netip.MustParseAddr("2001:db8::1"))
+	attrs3 := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath(aspath1),
+		bgp.NewPathAttributeCommunities([]uint32{100}),
+		mpreach3,
+	}
+	paths3 := append(paths[:1:1], ProcessMessage(bgp.NewBGPUpdateMessage(nil, attrs3, nil), peerR1(), time.Now(), false)...)
+	msgs = CreateUpdateMsgFromPaths(paths3)
+	assert.Equal(t, 2, len(msgs), "different attributes must produce separate UPDATEs")
+}
+
+func TestNotMergeV4NLRIs(t *testing.T) {
+	paths := make([]*Path, 0, 2)
+
+	aspath1 := []bgp.AsPathParamInterface{
+		bgp.NewAs4PathParam(2, []uint32{100}),
+	}
+	nexthop1, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr("1.1.1.1"))
+	attrs1 := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath(aspath1),
+		nexthop1,
+	}
+	nlri1, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("1.1.1.1/32"))
+	paths = append(paths, ProcessMessage(bgp.NewBGPUpdateMessage(nil, attrs1, []bgp.PathNLRI{{NLRI: nlri1}}), peerR1(), time.Now(), false)...)
+
+	nexthop2, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr("2.2.2.2"))
+	attrs2 := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath(aspath1),
+		nexthop2,
+	}
+	nlri2, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("2.2.2.2/32"))
+	paths = append(paths, ProcessMessage(bgp.NewBGPUpdateMessage(nil, attrs2, []bgp.PathNLRI{{NLRI: nlri2}}), peerR1(), time.Now(), false)...)
+
+	assert.NotEmpty(t, paths[0].GetHash(), paths[1].GetHash())
+
+	msgs := CreateUpdateMsgFromPaths(paths)
+	assert.Equal(t, len(msgs), 2)
+
+	paths[1].SetHash(paths[0].GetHash())
+	msgs = CreateUpdateMsgFromPaths(paths)
+	assert.Equal(t, len(msgs), 2)
+}
+
+func TestMergeV4Withdraw(t *testing.T) {
+	nr := 1024
+	paths := make([]*Path, 0, nr)
+	addrs := make([]string, 0, nr)
+	for i := range nr {
+		addrs = append(addrs, fmt.Sprintf("1.1.%d.%d", i>>8&0xff, i&0xff))
+		nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix(addrs[i] + "/32"))
+		// use different attribute for each nlri
+		aspath1 := []bgp.AsPathParamInterface{
+			bgp.NewAs4PathParam(2, []uint32{uint32(i)}),
+		}
+		nexthop, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr("1.1.1.1"))
+		attrs := []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath(aspath1),
+			nexthop,
+		}
+		msg := bgp.NewBGPUpdateMessage([]bgp.PathNLRI{{NLRI: nlri}}, attrs, nil)
+		paths = append(paths, ProcessMessage(msg, peerR1(), time.Now(), false)...)
+	}
+	msgs := CreateUpdateMsgFromPaths(paths)
+	assert.Equal(t, len(msgs), 2)
+
+	l := make([]bgp.PathNLRI, 0, nr)
+	for _, msg := range msgs {
+		u := msg.Body.(*bgp.BGPUpdate)
+		assert.Equal(t, len(u.PathAttributes), 0)
+		l = append(l, u.WithdrawnRoutes...)
+	}
+	assert.Equal(t, len(l), nr)
+	for i, addr := range addrs {
+		assert.Equal(t, addr, l[i].NLRI.(*bgp.IPAddrPrefix).Prefix.Addr().String())
+	}
+
+	for _, msg := range msgs {
+		d, _ := msg.Serialize()
+		assert.True(t, len(d) < bgp.BGP_MAX_MESSAGE_LENGTH)
+	}
+}
+
+// Test for issue #3308: AS4_PATH appearing before AS_PATH
+// This test ensures that when AS4_PATH (Type 17) appears before AS_PATH (Type 2)
+// in the attributes list, the code correctly handles the index adjustment after
+// AS4_PATH deletion without causing an index out of range panic.
+//
+// before:
+//
+//	as4-path : 400000, 300000, 40001 (Type 17, appears first)
+//	as-path  : 65000, 4000, 23456, 23456, 40001 (Type 2, appears second)
+//
+// expected result:
+//
+//	as-path  : 65000, 4000, 400000, 300000, 40001
+func TestAsPathAs4PathOrdering(t *testing.T) {
+	// Create AS_PATH with AS_TRANS
+	as := []uint16{65000, 4000, bgp.AS_TRANS, bgp.AS_TRANS, 40001}
+	params := []bgp.AsPathParamInterface{bgp.NewAsPathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as)}
+	aspath := bgp.NewPathAttributeAsPath(params)
+
+	// Create AS4_PATH
+	as4 := []uint32{400000, 300000, 40001}
+	param4s := []*bgp.As4PathParam{bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, as4)}
+	as4path := bgp.NewPathAttributeAs4Path(param4s)
+
+	// IMPORTANT: Put AS4_PATH before AS_PATH to reproduce issue #3308
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{as4path, aspath}, nil).Body.(*bgp.BGPUpdate)
+
+	// This should not panic
+	UpdatePathAttrs4ByteAs(logger, msg)
+
+	// Verify the result
+	assert.Equal(t, len(msg.PathAttributes), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value), 1)
+	assert.Equal(t, len(msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS), 5)
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[0], uint32(65000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[1], uint32(4000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[2], uint32(400000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[3], uint32(300000))
+	assert.Equal(t, msg.PathAttributes[0].(*bgp.PathAttributeAsPath).Value[0].(*bgp.As4PathParam).AS[4], uint32(40001))
+}
+
+func TestCreateUpdateMsgFromPathsKeepsLastAction(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		paths        func(*Path, *Path, *Path, *Path) []*Path
+		wantWithdraw bool
+		wantAnnounce bool
+		wantOther    bool
+		wantEOR      bool
+	}{
+		{
+			name: "withdraw last",
+			paths: func(announce, withdraw, other, eor *Path) []*Path {
+				return []*Path{announce, nil, eor, other, withdraw}
+			},
+			wantWithdraw: true,
+			wantOther:    true,
+			wantEOR:      true,
+		},
+		{
+			name: "announce last",
+			paths: func(announce, withdraw, other, eor *Path) []*Path {
+				return []*Path{withdraw, eor, announce}
+			},
+			wantAnnounce: true,
+			wantEOR:      true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			announce := newIPv4UpdatePath(t, "10.0.0.0/24")
+			withdraw := announce.Clone(true)
+			other := newIPv4UpdatePath(t, "10.0.1.0/24")
+			eor := NewEOR(bgp.RF_IPv4_UC)
+
+			msgs := CreateUpdateMsgFromPaths(tc.paths(announce, withdraw, other, eor))
+			withdrawn := make(map[string]bool)
+			announced := make(map[string]bool)
+			gotEOR := false
+			for _, msg := range msgs {
+				update := msg.Body.(*bgp.BGPUpdate)
+				if ok, family := update.IsEndOfRib(); ok && family == bgp.RF_IPv4_UC {
+					gotEOR = true
+				}
+				for _, nlri := range update.WithdrawnRoutes {
+					withdrawn[nlri.NLRI.String()] = true
+				}
+				for _, nlri := range update.NLRI {
+					announced[nlri.NLRI.String()] = true
+				}
+			}
+
+			assert.Equal(t, tc.wantWithdraw, withdrawn["10.0.0.0/24"])
+			assert.Equal(t, tc.wantAnnounce, announced["10.0.0.0/24"])
+			assert.Equal(t, tc.wantOther, announced["10.0.1.0/24"])
+			assert.Equal(t, tc.wantEOR, gotEOR)
+		})
+	}
+}
+
+func newIPv4UpdatePath(t *testing.T, prefix string) *Path {
+	t.Helper()
+	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix(prefix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nexthop, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+			bgp.NewAs4PathParam(2, []uint32{65001}),
+		}),
+		nexthop,
+	}
+	return NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
+}
+
+// CreateUpdateMsgFromAdjRIBInPaths reports the identifier the peer sent, and
+// leaves the one this speaker assigned alone. Two paths of the same prefix
+// stay two paths, which is the whole point of ADD-PATH.
+func TestCreateUpdateMsgFromAdjRIBInPathsUsesTheReceivedPathID(t *testing.T) {
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+			bgp.NewAs4PathParam(2, []uint32{100}),
+		}),
+	}
+	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	require.NoError(t, err)
+	nh, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.1"))
+	require.NoError(t, err)
+
+	paths := make([]*Path, 0, 2)
+	for _, remoteID := range []uint32{7, 8} {
+		p := NewPath(bgp.RF_IPv4_UC, peerR1(), bgp.PathNLRI{NLRI: nlri, ID: remoteID},
+			false, append(attrs, nh), time.Now(), false)
+		// The identifier this speaker would use to re-advertise the path.
+		// It must not reach the wire here, and it is the same for both
+		// paths so that a packer keying on it would drop one of them.
+		p.localID = 1
+		paths = append(paths, p)
+	}
+
+	options := &bgp.MarshallingOption{
+		AddPath: map[bgp.Family]bgp.BGPAddPathMode{
+			bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_BOTH,
+		},
+	}
+	msgs := CreateUpdateMsgFromAdjRIBInPaths(paths, options)
+
+	got := make([]uint32, 0, 2)
+	for _, msg := range msgs {
+		for _, n := range msg.Body.(*bgp.BGPUpdate).NLRI {
+			got = append(got, n.ID)
+		}
+	}
+	require.ElementsMatch(t, []uint32{7, 8}, got)
+
+	// The paths themselves are untouched.
+	for _, p := range paths {
+		require.Equal(t, uint32(1), p.localID)
+	}
+
+	// CreateUpdateMsgFromPaths still reports this speaker's identifier, so
+	// the two paths collapse into one.
+	msgs = CreateUpdateMsgFromPaths(paths, options)
+	got = got[:0]
+	for _, msg := range msgs {
+		for _, n := range msg.Body.(*bgp.BGPUpdate).NLRI {
+			got = append(got, n.ID)
+		}
+	}
+	require.Equal(t, []uint32{1}, got)
+}
+
+func TestNotMergeMPReachNLRIsWithDifferentLinkLocalNexthop(t *testing.T) {
+	global := netip.MustParseAddr("2001:db8::1")
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{100})}),
+	}
+
+	paths := make([]*Path, 0, 3)
+	for i, ll := range []string{"fe80::1", "fe80::1", "fe80::2"} {
+		nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix(fmt.Sprintf("2001:db8:%x::/64", i)))
+		mpreach, err := bgp.NewPathAttributeMpReachNLRI(bgp.RF_IPv6_UC, []bgp.PathNLRI{{NLRI: nlri}}, global, netip.MustParseAddr(ll))
+		require.NoError(t, err)
+		msg := bgp.NewBGPUpdateMessage(nil, append(attrs[:len(attrs):len(attrs)], mpreach), nil)
+		paths = append(paths, ProcessMessage(msg, peerR1(), time.Now(), false)...)
+	}
+
+	nlrisByLinkLocal := func(msgs []*bgp.BGPMessage) map[netip.Addr]int {
+		m := make(map[netip.Addr]int)
+		for _, msg := range msgs {
+			for _, attr := range msg.Body.(*bgp.BGPUpdate).PathAttributes {
+				if a, ok := attr.(*bgp.PathAttributeMpReachNLRI); ok {
+					assert.Equal(t, global, a.Nexthop)
+					m[a.LinkLocalNexthop] += len(a.Value)
+				}
+			}
+		}
+		return m
+	}
+
+	msgs := CreateUpdateMsgFromPaths(paths)
+	assert.Equal(t, 2, len(msgs), "different link-local nexthops must produce separate UPDATEs")
+	assert.Equal(t, map[netip.Addr]int{
+		netip.MustParseAddr("fe80::1"): 2,
+		netip.MustParseAddr("fe80::2"): 1,
+	}, nlrisByLinkLocal(msgs))
+
+	msgs = CreateUpdateMsgFromPaths(paths[2:])
+	assert.Equal(t, 1, len(msgs))
+	assert.Equal(t, map[netip.Addr]int{netip.MustParseAddr("fe80::2"): 1}, nlrisByLinkLocal(msgs))
+}
+
+// IPv4 paths with the same attributes and different next hops go in
+// different UPDATEs.
+func TestNotMergeV4NLRIsWithDifferentNexthop(t *testing.T) {
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{100})}),
+	}
+
+	paths := make([]*Path, 0, 3)
+	for i, nh := range []string{"192.0.2.1", "192.0.2.1", "192.0.2.2"} {
+		nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix(fmt.Sprintf("10.%d.0.0/24", i)))
+		nexthop, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr(nh))
+		require.NoError(t, err)
+		msg := bgp.NewBGPUpdateMessage(nil, append(attrs[:len(attrs):len(attrs)], nexthop), []bgp.PathNLRI{{NLRI: nlri}})
+		paths = append(paths, ProcessMessage(msg, peerR1(), time.Now(), false)...)
+	}
+
+	msgs := CreateUpdateMsgFromPaths(paths)
+	assert.Equal(t, 2, len(msgs), "different next hops must produce separate UPDATEs")
+	nlrisByNexthop := make(map[netip.Addr]int)
+	for _, msg := range msgs {
+		u := msg.Body.(*bgp.BGPUpdate)
+		for _, attr := range u.PathAttributes {
+			if a, ok := attr.(*bgp.PathAttributeNextHop); ok {
+				nlrisByNexthop[a.Value] += len(u.NLRI)
+			}
+		}
+	}
+	assert.Equal(t, map[netip.Addr]int{
+		netip.MustParseAddr("192.0.2.1"): 2,
+		netip.MustParseAddr("192.0.2.2"): 1,
+	}, nlrisByNexthop)
+}
+
+func BenchmarkCreateUpdateMsgFromPathsV4(b *testing.B) {
+	for _, n := range []int{1, 100} {
+		nlris := make([]bgp.PathNLRI, 0, n)
+		for i := range n {
+			nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix(fmt.Sprintf("10.%d.%d.0/24", i/256, i%256)))
+			nlris = append(nlris, bgp.PathNLRI{NLRI: nlri})
+		}
+		nexthop, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.1"))
+		attrs := []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{65001, 65002})}),
+			nexthop,
+			bgp.NewPathAttributeMultiExitDisc(100),
+			bgp.NewPathAttributeCommunities([]uint32{100, 200}),
+		}
+		paths := ProcessMessage(bgp.NewBGPUpdateMessage(nil, attrs, nlris), peerR1(), time.Now(), false)
+
+		b.Run(fmt.Sprintf("paths=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				CreateUpdateMsgFromPaths(paths)
+			}
+		})
+	}
+}
+
+func BenchmarkCreateUpdateMsgFromPathsMP(b *testing.B) {
+	for _, n := range []int{1, 100} {
+		nlris := make([]bgp.PathNLRI, 0, n)
+		for i := range n {
+			nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix(fmt.Sprintf("2001:db8:%x::/64", i)))
+			nlris = append(nlris, bgp.PathNLRI{NLRI: nlri})
+		}
+		mpreach, _ := bgp.NewPathAttributeMpReachNLRI(bgp.RF_IPv6_UC, nlris, netip.MustParseAddr("2001:db8::1"))
+		attrs := []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{65001, 65002})}),
+			bgp.NewPathAttributeMultiExitDisc(100),
+			bgp.NewPathAttributeCommunities([]uint32{100, 200}),
+			mpreach,
+		}
+		paths := ProcessMessage(bgp.NewBGPUpdateMessage(nil, attrs, nil), peerR1(), time.Now(), false)
+
+		b.Run(fmt.Sprintf("paths=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				CreateUpdateMsgFromPaths(paths)
+			}
+		})
+	}
+}
+
+// A path whose attributes leave no room for its NLRI in an UPDATE is not
+// dropped by the packer. It goes in an UPDATE of its own, which fails to
+// serialize and is logged when it is sent.
+func TestCreateUpdateMsgFromPathsAttrsTooLong(t *testing.T) {
+	communities := make([]uint32, 1100) // 4400 bytes, over 4096
+	for i := range communities {
+		communities[i] = uint32(i)
+	}
+	for _, tt := range []struct {
+		name   string
+		family bgp.Family
+		prefix string
+		nh     string
+	}{
+		{"IPv4", bgp.RF_IPv4_UC, "10.1.0.0/24", "192.0.2.1"},
+		{"IPv6", bgp.RF_IPv6_UC, "2001:db8:1::/64", "2001:db8::1"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix(tt.prefix))
+			attrs := []bgp.PathAttributeInterface{
+				bgp.NewPathAttributeOrigin(0),
+				bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{100})}),
+				bgp.NewPathAttributeCommunities(communities),
+			}
+			var msg *bgp.BGPMessage
+			if tt.family == bgp.RF_IPv4_UC {
+				nh, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr(tt.nh))
+				msg = bgp.NewBGPUpdateMessage(nil, append(attrs, nh), []bgp.PathNLRI{{NLRI: nlri}})
+			} else {
+				mp, _ := bgp.NewPathAttributeMpReachNLRI(tt.family, []bgp.PathNLRI{{NLRI: nlri}}, netip.MustParseAddr(tt.nh))
+				msg = bgp.NewBGPUpdateMessage(nil, append(attrs, mp), nil)
+			}
+			paths := ProcessMessage(msg, peerR1(), time.Now(), false)
+			require.Len(t, paths, 1)
+
+			msgs := CreateUpdateMsgFromPaths(paths)
+			n := 0
+			for _, m := range msgs {
+				u := m.Body.(*bgp.BGPUpdate)
+				n += len(u.NLRI)
+				for _, a := range u.PathAttributes {
+					if mp, ok := a.(*bgp.PathAttributeMpReachNLRI); ok {
+						n += len(mp.Value)
+					}
+				}
+				_, err := m.Serialize()
+				assert.Error(t, err, "the UPDATE is too long for a peer without extended messages")
+			}
+			assert.Equal(t, 1, n, "the NLRI must not be dropped")
+		})
+	}
+}
+
+// IPv4 unicast paths with the same IPv6 next hop (RFC 5549) go in one
+// MP_REACH_NLRI.
+func TestMergeV4NLRIsWithIPv6Nexthop(t *testing.T) {
+	nlris := make([]bgp.PathNLRI, 0, 3)
+	for i := range 3 {
+		nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix(fmt.Sprintf("10.%d.0.0/24", i)))
+		nlris = append(nlris, bgp.PathNLRI{NLRI: nlri})
+	}
+	reach, err := bgp.NewPathAttributeMpReachNLRI(bgp.RF_IPv4_UC, nlris, netip.MustParseAddr("2001:db8::1"))
+	require.NoError(t, err)
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{100})}),
+		reach,
+	}
+	paths := ProcessMessage(bgp.NewBGPUpdateMessage(nil, attrs, nil), peerR1(), time.Now(), false)
+	require.Len(t, paths, 3)
+
+	msgs := CreateUpdateMsgFromPaths(paths)
+	require.Len(t, msgs, 1)
+	u := msgs[0].Body.(*bgp.BGPUpdate)
+	assert.Empty(t, u.NLRI)
+	var got *bgp.PathAttributeMpReachNLRI
+	for _, a := range u.PathAttributes {
+		if mp, ok := a.(*bgp.PathAttributeMpReachNLRI); ok {
+			got = mp
+		}
+	}
+	require.NotNil(t, got)
+	assert.Equal(t, netip.MustParseAddr("2001:db8::1"), got.Nexthop)
+	assert.Len(t, got.Value, 3)
+}
+
+// The NLRIs in the NLRI field are packed by their real length, not by the
+// longest possible one.
+func TestMergeV4NLRIsByLength(t *testing.T) {
+	// 1000 /24 prefixes take 4000 bytes, which fit in one UPDATE with
+	// small attributes.
+	nlris := make([]bgp.PathNLRI, 0, 1000)
+	for i := range 1000 {
+		nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix(fmt.Sprintf("10.%d.%d.0/24", i/256, i%256)))
+		nlris = append(nlris, bgp.PathNLRI{NLRI: nlri})
+	}
+	nh, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.1"))
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{100})}),
+		nh,
+	}
+	paths := ProcessMessage(bgp.NewBGPUpdateMessage(nil, attrs, nlris), peerR1(), time.Now(), false)
+	require.Len(t, paths, 1000)
+
+	for _, tt := range []struct {
+		name  string
+		paths []*Path
+	}{
+		{"announce", paths},
+		{"withdraw", func() []*Path {
+			w := make([]*Path, 0, len(paths))
+			for _, p := range paths {
+				w = append(w, p.Clone(true))
+			}
+			return w
+		}()},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			msgs := CreateUpdateMsgFromPaths(tt.paths)
+			require.Len(t, msgs, 1)
+			b, err := msgs[0].Serialize()
+			require.NoError(t, err)
+			assert.LessOrEqual(t, len(b), bgp.BGP_MAX_MESSAGE_LENGTH)
+		})
+	}
+}
+
+// An UPDATE that fills 4096 bytes, received from a peer without extended
+// messages, gets 14 more bytes of ORIGINATOR_ID and CLUSTER_LIST when it is
+// reflected to a route reflector client. The packer used to panic on that.
+func TestCreateUpdateMsgFromPathsReflectedFullUpdate(t *testing.T) {
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("0.0.0.0/0"))
+	nh, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.1"))
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{65000})}),
+		nh,
+	}
+	used := 0
+	for _, a := range attrs {
+		used += a.Len()
+	}
+	// 4096 = 19 + 2 + 2 + attributes + 1 byte of NLRI. COMMUNITIES
+	// takes 4 bytes of header with the extended length.
+	communities := make([]uint32, (4096-19-2-2-1-used-4)/4)
+	for i := range communities {
+		communities[i] = uint32(i)
+	}
+	msg := bgp.NewBGPUpdateMessage(nil, append(attrs, bgp.NewPathAttributeCommunities(communities)), []bgp.PathNLRI{{NLRI: nlri}})
+	b, err := msg.Serialize()
+	require.NoError(t, err)
+	require.Len(t, b, bgp.BGP_MAX_MESSAGE_LENGTH)
+	msg, err = bgp.ParseBGPMessage(b)
+	require.NoError(t, err)
+
+	source := &PeerInfo{AS: 65000, LocalAS: 65000, ID: netip.MustParseAddr("10.0.0.2"), Address: netip.MustParseAddr("10.0.0.2")}
+	paths := ProcessMessage(msg, source, time.Now(), false)
+	require.Len(t, paths, 1)
+
+	global := &oc.Global{Config: oc.GlobalConfig{As: 65000, RouterId: netip.MustParseAddr("10.0.0.1")}}
+	client := &PeerInfo{
+		AS:                      65000,
+		LocalAS:                 65000,
+		PeerType:                oc.PEER_TYPE_INTERNAL,
+		RouteReflectorClient:    true,
+		RouteReflectorClusterID: netip.MustParseAddr("10.0.0.1"),
+		Address:                 netip.MustParseAddr("10.0.0.3"),
+		LocalAddress:            netip.MustParseAddr("10.0.0.1"),
+	}
+	msgs := CreateUpdateMsgFromPaths([]*Path{UpdatePathAttrs(logger, global, client, paths[0])})
+	require.Len(t, msgs, 1)
+	assert.Len(t, msgs[0].Body.(*bgp.BGPUpdate).NLRI, 1)
+	_, err = msgs[0].Serialize()
+	assert.Error(t, err, "too long for a peer without extended messages")
+}
+
+// The packer sizes UPDATEs by the serialized attributes, not by Len().
+// Len() comes from the Length field, which PrependAsn leaves stale when it
+// changes AS_PATH in place, so UPDATEs sized by it came out too long.
+func TestCreateUpdateMsgFromPathsAfterPrepend(t *testing.T) {
+	action, err := NewAsPathPrependAction(oc.SetAsPathPrepend{As: "65000", RepeatN: 2})
+	require.NoError(t, err)
+
+	for _, tt := range []struct {
+		name   string
+		family bgp.Family
+		prefix func(int) string
+	}{
+		{"IPv4 /24", bgp.RF_IPv4_UC, func(i int) string { return fmt.Sprintf("10.%d.%d.0/24", i/256, i%256) }},
+		{"IPv4 /32", bgp.RF_IPv4_UC, func(i int) string { return fmt.Sprintf("10.0.%d.%d/32", i/256, i%256) }},
+		{"IPv6 /48", bgp.RF_IPv6_UC, func(i int) string { return fmt.Sprintf("2001:db8:%x::/48", i) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			nlris := make([]bgp.PathNLRI, 0, 1100)
+			for i := range 1100 {
+				nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix(tt.prefix(i)))
+				nlris = append(nlris, bgp.PathNLRI{NLRI: nlri})
+			}
+			attrs := []bgp.PathAttributeInterface{
+				bgp.NewPathAttributeOrigin(0),
+				bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{65100})}),
+			}
+			var msg *bgp.BGPMessage
+			if tt.family == bgp.RF_IPv4_UC {
+				nh, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.1"))
+				msg = bgp.NewBGPUpdateMessage(nil, append(attrs, nh), nlris)
+			} else {
+				reach, _ := bgp.NewPathAttributeMpReachNLRI(tt.family, nlris, netip.MustParseAddr("2001:db8::1"))
+				msg = bgp.NewBGPUpdateMessage(nil, append(attrs, reach), nil)
+			}
+			paths := ProcessMessage(msg, peerR1(), time.Now(), false)
+			require.Len(t, paths, 1100)
+
+			prepended := make([]*Path, 0, len(paths))
+			for _, p := range paths {
+				c, err := action.Apply(p.Clone(false), nil)
+				require.NoError(t, err)
+				prepended = append(prepended, c)
+			}
+
+			n := 0
+			for _, m := range CreateUpdateMsgFromPaths(prepended) {
+				_, err := m.Serialize()
+				require.NoError(t, err)
+				u := m.Body.(*bgp.BGPUpdate)
+				n += len(u.NLRI)
+				for _, a := range u.PathAttributes {
+					if mp, ok := a.(*bgp.PathAttributeMpReachNLRI); ok {
+						n += len(mp.Value)
+					}
+				}
+			}
+			assert.Equal(t, 1100, n)
+		})
+	}
+}

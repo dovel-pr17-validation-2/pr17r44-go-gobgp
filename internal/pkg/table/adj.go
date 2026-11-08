@@ -1,0 +1,395 @@
+// Copyright (C) 2015 Nippon Telegraph and Telephone Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package table
+
+import (
+	"fmt"
+	"log/slog"
+	"slices"
+
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
+)
+
+type AdjRib struct {
+	accepted map[bgp.Family]int
+	total    map[bgp.Family]int
+	table    map[bgp.Family]*Table
+	logger   *slog.Logger
+}
+
+func NewAdjRib(logger *slog.Logger, rfList []bgp.Family) *AdjRib {
+	m := make(map[bgp.Family]*Table)
+	for _, f := range rfList {
+		m[f] = newSingleShardTable(logger, f)
+	}
+	return &AdjRib{
+		table:    m,
+		accepted: make(map[bgp.Family]int),
+		total:    make(map[bgp.Family]int),
+		logger:   logger,
+	}
+}
+
+// SetRejected replaces a cached path without retaining another layer of path
+// history. Attribute slices are copied so later changes cannot alter old views.
+func (adj *AdjRib) SetRejected(path *Path, rejected bool) (*Path, []*Path) {
+	if path.IsRejected() == rejected {
+		return path, nil
+	}
+	updated := path.Clone(false)
+	updated.parent = path.parent
+	updated.info = path.info
+	updated.pathAttrs = slices.Clone(path.pathAttrs)
+	updated.dels = slices.Clone(path.dels)
+	updated.SetRejected(rejected)
+	withdrawals := adj.Update([]*Path{updated})
+	return updated, withdrawals
+}
+
+// Update applies pathList to the Adj-RIB-In.
+//
+// It returns a withdrawal for every cached path that went from accepted to
+// rejected. The caller must feed those to the RIB. A rejected path is not a
+// candidate for route selection, so the path the same peer had installed for
+// that NLRI has to go, exactly as BGP replaces a route when the same NLRI is
+// re-advertised.
+//
+// The withdrawal is marked dropped so that the table releases the local path
+// ID, and the replacement entry is stripped of that ID. The two go together:
+// a rejected path is never advertised, so nothing may keep holding the ID,
+// and the path gets a fresh one if it is admitted again.
+func (adj *AdjRib) Update(pathList []*Path) []*Path {
+	var withdrawals []*Path
+	for _, path := range pathList {
+		if path == nil || path.IsEOR() {
+			continue
+		}
+		rf := path.GetFamily()
+		t := adj.table[rf]
+		if t == nil {
+			continue
+		}
+		nlri := path.GetNlri()
+		shard := t.destinations.getShardForInsert(nlri)
+
+		// Lock shard for entire operation
+		shard.mu.Lock()
+
+		d := t.getOrCreateDest(shard, nlri, 0)
+		var old *Path
+		idx := -1
+		for i, p := range d.knownPathList {
+			if p.remoteID == path.remoteID {
+				idx = i
+				break
+			}
+		}
+		if idx != -1 {
+			old = d.knownPathList[idx]
+		}
+
+		if path.IsWithdraw {
+			if idx != -1 {
+				d.knownPathList = append(d.knownPathList[:idx], d.knownPathList[idx+1:]...)
+				adj.total[rf]--
+				if !old.IsRejected() {
+					adj.accepted[rf]--
+				}
+			}
+			if len(d.knownPathList) == 0 {
+				t.deleteDest(shard, d)
+			}
+			path.SetDropped(true)
+		} else {
+			if idx != -1 {
+				if old.IsRejected() && !path.IsRejected() {
+					adj.accepted[rf]++
+				} else if !old.IsRejected() && path.IsRejected() {
+					adj.accepted[rf]--
+					w := old.Clone(true)
+					w.SetDropped(true)
+					withdrawals = append(withdrawals, w)
+					path.localID = 0
+				}
+				if old.Equal(path) {
+					path.setTimestamp(old.GetTimestamp())
+				}
+				d.knownPathList[idx] = path
+			} else {
+				d.knownPathList = append(d.knownPathList, path)
+				adj.total[rf]++
+				if !path.IsRejected() {
+					adj.accepted[rf]++
+				}
+			}
+		}
+
+		shard.mu.Unlock()
+	}
+	return withdrawals
+}
+
+/*
+The provided pathList is expected to be the real candidate routes after policy evaluation.
+
+	For routes that are filtered by policy, there could be a mismatch between display
+	and actual rib sent to the peer (if softreset out was not run).
+	Only used to display adj-out because we do not maintain a separate adj-out table
+*/
+func (adj *AdjRib) UpdateAdjRibOut(pathList []*Path) {
+	for _, path := range pathList {
+		if path == nil || path.IsEOR() {
+			continue
+		}
+		rf := path.GetFamily()
+		t := adj.table[rf]
+		if t == nil {
+			continue
+		}
+		nlri := path.GetNlri()
+		shard := t.destinations.getShardForInsert(nlri)
+
+		shard.mu.Lock()
+		d := t.getOrCreateDest(shard, nlri, 0)
+		d.knownPathList = append(d.knownPathList, path)
+		adj.total[rf]++
+		shard.mu.Unlock()
+	}
+}
+
+func (adj *AdjRib) walk(families []bgp.Family, fn func(*destination) bool) {
+	for _, f := range families {
+		if t, ok := adj.table[f]; ok {
+			for _, d := range t.GetDestinations() {
+				if fn(d) {
+					return
+				}
+			}
+		}
+	}
+}
+
+func (adj *AdjRib) walkActive(families []bgp.Family, fn func(*destination) bool) {
+	for _, f := range families {
+		t, ok := adj.table[f]
+		if !ok {
+			continue
+		}
+		shards := t.destinations.loadShards()
+		for i := range shards {
+			shard := &shards[i]
+			shard.mu.Lock()
+			stop := false
+			for _, dests := range shard.mp {
+				for _, d := range dests {
+					if fn(d) {
+						stop = true
+						break
+					}
+				}
+				if stop {
+					break
+				}
+			}
+			shard.mu.Unlock()
+			if stop {
+				return
+			}
+		}
+	}
+}
+
+func (adj *AdjRib) PathList(rfList []bgp.Family, accepted bool) []*Path {
+	pathList := make([]*Path, 0, adj.Count(rfList))
+	adj.walk(rfList, func(d *destination) bool {
+		for _, p := range d.knownPathList {
+			if accepted && p.IsRejected() {
+				continue
+			}
+			pathList = append(pathList, p)
+		}
+		return false
+	})
+	return pathList
+}
+
+func (adj *AdjRib) Count(rfList []bgp.Family) int {
+	count := 0
+	for _, rf := range rfList {
+		count += adj.total[rf]
+	}
+	return count
+}
+
+func (adj *AdjRib) Accepted(rfList []bgp.Family) int {
+	count := 0
+	for _, rf := range rfList {
+		if n, ok := adj.accepted[rf]; ok {
+			count += n
+		}
+	}
+	return count
+}
+
+func (adj *AdjRib) Drop(rfList []bgp.Family) []*Path {
+	l := make([]*Path, 0, adj.Count(rfList))
+	adj.walk(rfList, func(d *destination) bool {
+		for _, p := range d.knownPathList {
+			// Rejected paths were never installed in the local RIB; do not
+			// emit withdrawals for them (avoids "No matching path for withdraw").
+			if p.IsRejected() {
+				continue
+			}
+			w := p.Clone(true)
+			w.SetDropped(true)
+			l = append(l, w)
+		}
+		return false
+	})
+	for _, rf := range rfList {
+		adj.table[rf] = newSingleShardTable(adj.logger, rf)
+		adj.accepted[rf] = 0
+		adj.total[rf] = 0
+	}
+	return l
+}
+
+// DropStale removes the stale paths from the Adj-RIB-In and returns the
+// withdrawals that the caller must propagate.
+//
+// The two are not the same list. A rejected path was never installed in the
+// RIB, so no withdrawal is owed for it, but its Adj-RIB-In entry still has to
+// go. The removal is done by feeding the withdrawals back to Update, so the
+// list passed there covers every stale path, and the returned list leaves the
+// rejected paths out.
+func (adj *AdjRib) DropStale(rfList []bgp.Family) []*Path {
+	size := adj.Count(rfList)
+	updates := make([]*Path, 0, size)
+	pathList := make([]*Path, 0, size)
+	adj.walk(rfList, func(d *destination) bool {
+		for _, p := range d.knownPathList {
+			if p.IsStale() {
+				w := p.Clone(true)
+				w.SetDropped(true)
+				updates = append(updates, w)
+				if !p.IsRejected() {
+					pathList = append(pathList, w)
+				}
+			}
+		}
+		return false
+	})
+	adj.Update(updates)
+	return pathList
+}
+
+// StaleAll marks the paths in the Adj-RIB-In stale and returns the ones that
+// the caller must propagate. A path that is already stale is left as it is:
+// it was marked in an earlier restart and has been propagated.
+func (adj *AdjRib) StaleAll(rfList []bgp.Family) []*Path {
+	pathList := make([]*Path, 0, adj.Count(rfList))
+	adj.walkActive(rfList, func(d *destination) bool {
+		for i, p := range d.knownPathList {
+			if p.IsStale() {
+				continue
+			}
+			n := p.Clone(false)
+			n.MarkStale(true)
+			n.SetRejected(p.IsRejected())
+			d.knownPathList[i] = n
+			if !n.IsRejected() {
+				pathList = append(pathList, n)
+			}
+		}
+		return false
+	})
+	return pathList
+}
+
+// MarkLLGRStaleOrDrop attaches LLGR_STALE to the paths in the Adj-RIB-In and
+// removes the ones that carry NO_LLGR. A path that already carries
+// LLGR_STALE is left as it is. It returns the paths that the caller must
+// propagate.
+//
+// As in DropStale, the list that goes to Update and the returned list are not
+// the same. A rejected path removed for NO_LLGR was never installed in the
+// RIB, so it is removed from the Adj-RIB-In without a withdrawal for the
+// caller.
+func (adj *AdjRib) MarkLLGRStaleOrDrop(rfList []bgp.Family) []*Path {
+	size := adj.Count(rfList)
+	updates := make([]*Path, 0, size)
+	pathList := make([]*Path, 0, size)
+	adj.walkActive(rfList, func(d *destination) bool {
+		for i, p := range d.knownPathList {
+			if p.HasNoLLGR() {
+				n := p.Clone(true)
+				n.SetDropped(true)
+				updates = append(updates, n)
+				if !p.IsRejected() {
+					pathList = append(pathList, n)
+				}
+			} else if p.IsLLGRStale() {
+				// Marked in an earlier restart, or received with it.
+				continue
+			} else {
+				n := p.Clone(false)
+				n.SetRejected(p.IsRejected())
+				n.SetCommunities([]uint32{uint32(bgp.COMMUNITY_LLGR_STALE)}, false)
+				if p.IsRejected() {
+					d.knownPathList[i] = n
+				} else {
+					updates = append(updates, n)
+					pathList = append(pathList, n)
+				}
+			}
+		}
+		return false
+	})
+	adj.Update(updates)
+	return pathList
+}
+
+func (adj *AdjRib) Select(family bgp.Family, accepted bool, option ...TableSelectOption) (*Table, error) {
+	t, ok := adj.table[family]
+	if !ok {
+		t = newSingleShardTable(adj.logger, family)
+	}
+	option = append(option, TableSelectOption{adj: true})
+	return t.Select(option...)
+}
+
+func (adj *AdjRib) TableInfo(family bgp.Family) (*TableInfo, error) {
+	if _, ok := adj.table[family]; !ok {
+		return nil, fmt.Errorf("%s unsupported", family)
+	}
+	rf := []bgp.Family{family}
+	// A peer with ADD-PATH sends several paths for one destination, so
+	// the path count is not the destination count. There is no counter
+	// for destinations; walk the table instead. This is a management
+	// operation and is not on the update path.
+	d := 0
+	adj.walkActive(rf, func(dest *destination) bool {
+		if len(dest.knownPathList) != 0 {
+			d++
+		}
+		return false
+	})
+	return &TableInfo{
+		NumDestination: d,
+		NumPath:        adj.Count(rf),
+		NumAccepted:    adj.Accepted(rf),
+	}, nil
+}

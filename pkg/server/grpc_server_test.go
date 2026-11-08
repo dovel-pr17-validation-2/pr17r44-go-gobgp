@@ -1,0 +1,1278 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"net/netip"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/internal/pkg/table"
+	"github.com/osrg/gobgp/v4/pkg/apiutil"
+	"github.com/osrg/gobgp/v4/pkg/config/oc"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	tspb "google.golang.org/protobuf/types/known/timestamppb"
+)
+
+func mustApi2apiutilPath(path *api.Path) *apiutil.Path {
+	p, err := api2apiutilPath(path)
+	if err != nil {
+		panic(fmt.Sprintf("failed to convert api.Path to apiutil.Path: %v", err))
+	}
+	return p
+}
+
+func TestParseHost(t *testing.T) {
+	tsts := []struct {
+		name          string
+		host          string
+		expectNetwork string
+		expectAddr    string
+	}{
+		{
+			name:          "schemeless tcp host defaults to tcp",
+			host:          "127.0.0.1:50051",
+			expectNetwork: "tcp",
+			expectAddr:    "127.0.0.1:50051",
+		},
+		{
+			name:          "schemeless with only port defaults to tcp",
+			host:          ":50051",
+			expectNetwork: "tcp",
+			expectAddr:    ":50051",
+		},
+		{
+			name:          "unix socket",
+			host:          "unix:///var/run/gobgp.socket",
+			expectNetwork: "unix",
+			expectAddr:    "/var/run/gobgp.socket",
+		},
+	}
+
+	for _, tst := range tsts {
+		t.Run(tst.name, func(t *testing.T) {
+			gotNetwork, gotAddr := parseHost(tst.host)
+			assert.Equal(t, tst.expectNetwork, gotNetwork)
+			assert.Equal(t, tst.expectAddr, gotAddr)
+		})
+	}
+}
+
+func TestNewPeerGroupFromAPIStructRejectsInvalidAllowOwnAsn(t *testing.T) {
+	_, err := newPeerGroupFromAPIStruct(&api.PeerGroup{
+		Conf: &api.PeerGroupConf{
+			PeerGroupName: "pg",
+			AllowOwnAsn:   256,
+		},
+	})
+	assert.ErrorContains(t, err, "allow_own_asn is out of range")
+}
+
+func TestNewNeighborFromAPIStructIgnoresStateCapabilities(t *testing.T) {
+	// A capability with no value used to make UnmarshalCapabilities
+	// dereference nil.
+	pconf, err := newNeighborFromAPIStruct(&api.Peer{
+		Conf: &api.PeerConf{
+			NeighborAddress: "192.0.2.1",
+			PeerAsn:         65001,
+		},
+		State: &api.PeerState{
+			LocalCap:  []*api.Capability{{Cap: &api.Capability_MultiProtocol{}}},
+			RemoteCap: []*api.Capability{{Cap: &api.Capability_GracefulRestart{}}},
+			RouterId:  "192.0.2.2",
+		},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, pconf.State.LocalCapabilityList)
+	assert.Empty(t, pconf.State.RemoteCapabilityList)
+	assert.Equal(t, netip.MustParseAddr("192.0.2.2"), pconf.State.RemoteRouterId)
+}
+
+func TestNewNeighborFromAPIStructTcpAo(t *testing.T) {
+	newNeighbor := func(t *testing.T, tcpAo *api.TcpAoPeerConfig) (*oc.Neighbor, error) {
+		t.Helper()
+		return newNeighborFromAPIStruct(&api.Peer{
+			Conf: &api.PeerConf{
+				NeighborAddress: "192.0.2.1",
+				PeerAsn:         65001,
+			},
+			TcpAo: tcpAo,
+		})
+	}
+
+	t.Run("keychain_and_send_id", func(t *testing.T) {
+		pconf, err := newNeighbor(t, &api.TcpAoPeerConfig{Keychain: "fabric", SendId: 3})
+		require.NoError(t, err)
+		assert.Equal(t, oc.KeychainRef("fabric"), pconf.TcpAo.Config.Keychain)
+		assert.Equal(t, uint8(3), pconf.TcpAo.Config.SendId)
+	})
+
+	// RFC 5925 section 3.1 requires every MKT ID from 0 to 255 to be
+	// supported, so both ends of that range must survive the conversion.
+	t.Run("send_id_bounds", func(t *testing.T) {
+		for _, sendID := range []uint32{0, 255} {
+			pconf, err := newNeighbor(t, &api.TcpAoPeerConfig{Keychain: "fabric", SendId: sendID})
+			require.NoError(t, err)
+			assert.Equal(t, uint8(sendID), pconf.TcpAo.Config.SendId)
+		}
+	})
+
+	t.Run("send_id_out_of_range", func(t *testing.T) {
+		_, err := newNeighbor(t, &api.TcpAoPeerConfig{Keychain: "fabric", SendId: 256})
+		assert.ErrorContains(t, err, "outside 0..255")
+	})
+
+	t.Run("no_tcp_ao", func(t *testing.T) {
+		pconf, err := newNeighbor(t, nil)
+		require.NoError(t, err)
+		assert.Equal(t, oc.TcpAoConfig{}, pconf.TcpAo.Config)
+	})
+}
+
+func TestNewPeerGroupFromAPIStructTcpAo(t *testing.T) {
+	newPeerGroup := func(t *testing.T, tcpAo *api.TcpAoPeerConfig) (*oc.PeerGroup, error) {
+		t.Helper()
+		return newPeerGroupFromAPIStruct(&api.PeerGroup{
+			Conf:  &api.PeerGroupConf{PeerGroupName: "pg"},
+			TcpAo: tcpAo,
+		})
+	}
+
+	t.Run("keychain_and_send_id", func(t *testing.T) {
+		pconf, err := newPeerGroup(t, &api.TcpAoPeerConfig{Keychain: "fabric", SendId: 7})
+		require.NoError(t, err)
+		assert.Equal(t, oc.KeychainRef("fabric"), pconf.TcpAo.Config.Keychain)
+		assert.Equal(t, uint8(7), pconf.TcpAo.Config.SendId)
+	})
+
+	t.Run("send_id_out_of_range", func(t *testing.T) {
+		_, err := newPeerGroup(t, &api.TcpAoPeerConfig{Keychain: "fabric", SendId: 256})
+		assert.ErrorContains(t, err, "outside 0..255")
+	})
+
+	t.Run("no_tcp_ao", func(t *testing.T) {
+		pconf, err := newPeerGroup(t, nil)
+		require.NoError(t, err)
+		assert.Equal(t, oc.TcpAoConfig{}, pconf.TcpAo.Config)
+	})
+}
+
+func TestToPathApi(t *testing.T) {
+	type args struct {
+		path            *table.Path
+		onlyBinary      bool
+		nlriBinary      bool
+		attributeBinary bool
+	}
+	n, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/8"))
+	tests := []struct {
+		name string
+		args args
+		want *api.Path
+	}{
+		{
+			name: "ipv4 path",
+			args: args{
+				path: table.NewPath(bgp.RF_IPv4_UC, &table.PeerInfo{
+					ID:           netip.MustParseAddr("10.10.10.10"),
+					LocalID:      netip.MustParseAddr("10.11.11.11"),
+					Address:      netip.MustParseAddr("10.12.12.12"),
+					LocalAddress: netip.MustParseAddr("10.13.13.13"),
+				},
+					bgp.PathNLRI{NLRI: n},
+					false,
+					[]bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0)},
+					time.Time{},
+					false),
+			},
+			want: &api.Path{
+				Nlri:   nlri(n),
+				Pattrs: attrs([]bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0)}),
+				Family: &api.Family{
+					Afi:  api.Family_AFI_IP,
+					Safi: api.Family_SAFI_UNICAST,
+				},
+				Validation: &api.Validation{},
+				NeighborIp: "10.12.12.12",
+				SourceId:   "10.10.10.10",
+			},
+		},
+		{
+			name: "eor ipv4 path",
+			args: args{
+				path: eor(bgp.RF_IPv4_UC),
+			},
+			want: &api.Path{
+				Family: &api.Family{
+					Afi:  api.Family_AFI_IP,
+					Safi: api.Family_SAFI_UNICAST,
+				},
+				Pattrs:     []*api.Attribute{},
+				Validation: &api.Validation{},
+				NeighborIp: "10.12.12.12",
+				SourceId:   "10.10.10.10",
+			},
+		},
+		{
+			name: "eor vpn path",
+			args: args{
+				path: eor(bgp.RF_IPv4_VPN),
+			},
+			want: &api.Path{
+				Family: &api.Family{
+					Afi:  api.Family_AFI_IP,
+					Safi: api.Family_SAFI_MPLS_VPN,
+				},
+				Pattrs:     []*api.Attribute{},
+				Validation: &api.Validation{},
+				NeighborIp: "10.12.12.12",
+				SourceId:   "10.10.10.10",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apiPath := toPathApi(toPathApiUtil(tt.args.path), tt.args.onlyBinary, tt.args.nlriBinary, tt.args.attributeBinary)
+			if tt.want.Nlri != nil {
+				assert.Equal(t, tt.want.Nlri, apiPath.Nlri, "not equal nlri")
+			}
+			assert.Equal(t, tt.want.Pattrs, apiPath.Pattrs, "not equal attrs")
+			assert.Equal(t, tt.want.Family, apiPath.Family, "not equal family")
+			assert.Equal(t, tt.want.NeighborIp, apiPath.NeighborIp, "not equal neighbor")
+		})
+	}
+}
+
+func eor(f bgp.Family) *table.Path {
+	p := table.NewEOR(f)
+	p.SetSource(&table.PeerInfo{
+		ID:           netip.MustParseAddr("10.10.10.10"),
+		LocalID:      netip.MustParseAddr("10.11.11.11"),
+		Address:      netip.MustParseAddr("10.12.12.12"),
+		LocalAddress: netip.MustParseAddr("10.13.13.13"),
+	})
+	return p
+}
+
+func nlri(nlri bgp.NLRI) *api.NLRI {
+	apiNlri, _ := apiutil.MarshalNLRI(nlri)
+	return apiNlri
+}
+
+func attrs(attrs []bgp.PathAttributeInterface) []*api.Attribute {
+	apiAttrs, _ := apiutil.MarshalPathAttributes(attrs)
+	return apiAttrs
+}
+
+// NewBgpServer starts the gRPC listener in a goroutine, so the unix socket
+// may not exist yet when it returns. A client RPC sent before that fails with
+// Unavailable.
+func waitGRPCSocket(t *testing.T, socketAddr string) {
+	t.Helper()
+	path := strings.TrimPrefix(socketAddr, "unix://")
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}, 10*time.Second, 10*time.Millisecond, "gRPC socket %s was not created", path)
+}
+
+//nolint:errcheck // WatchEvent won't return an error here
+func GRPCwaitState(t *testing.T, s api.GoBgpServiceClient, state api.PeerState_SessionState, expectedFamilies ...bgp.Family) *sync.WaitGroup {
+	wg := &sync.WaitGroup{}
+	watchCtx, watchCancel := context.WithCancel(context.Background())
+	wg.Add(1)
+
+	resp, err := s.WatchEvent(watchCtx, &api.WatchEventRequest{Peer: &api.WatchEventRequest_Peer{}})
+	require.NoError(t, err, "failed to start watch event")
+
+	go func() {
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			default:
+				r, err := resp.Recv()
+				assert.NoError(t, err, "failed to receive watch event response")
+
+				if peer := r.GetPeer(); peer != nil {
+					if peer.Type == api.WatchEventResponse_PeerEvent_TYPE_STATE && peer.Peer.State.SessionState == state {
+						remoteCaps, err := apiutil.UnmarshalCapabilities(peer.Peer.GetState().GetRemoteCap())
+						if err != nil {
+							t.Errorf("failed to unmarshal remote capabilities: %v", err)
+						}
+						for _, rf := range expectedFamilies {
+							found := false
+							for _, cap := range remoteCaps {
+								if cap.Code() == bgp.BGP_CAP_MULTIPROTOCOL && cap.(*bgp.CapMultiProtocol).CapValue == rf {
+									found = true
+									break
+								}
+							}
+							if !found {
+								return
+							}
+						}
+						watchCancel()
+						wg.Done()
+					}
+				}
+			}
+		}
+	}()
+	return wg
+}
+
+func GRPCwaitActive(t *testing.T, s api.GoBgpServiceClient) *sync.WaitGroup {
+	return GRPCwaitState(t, s, api.PeerState_SESSION_STATE_ACTIVE)
+}
+
+func GRPCwaitEstablished(t *testing.T, s api.GoBgpServiceClient, rfs ...bgp.Family) *sync.WaitGroup {
+	return GRPCwaitState(t, s, api.PeerState_SESSION_STATE_ESTABLISHED, rfs...)
+}
+
+func TestGRPCWatchEvent(t *testing.T) {
+	assert := assert.New(t)
+
+	socketName, err := os.MkdirTemp("", "gobgp-grpc-test-*")
+	assert.NoError(err)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(socketName)
+	})
+	socketAddr := "unix://" + socketName + "/gobgp.sock"
+
+	s := NewBgpServer(GrpcListenAddress(socketAddr))
+	go s.Serve()
+	defer s.Stop()
+
+	err = s.StartBgp(context.Background(), &api.StartBgpRequest{
+		Global: &api.Global{
+			Asn:        1,
+			RouterId:   "1.1.1.1",
+			ListenPort: 10179,
+		},
+	})
+	assert.NoError(err)
+	waitGRPCSocket(t, socketAddr)
+
+	conn, err := grpc.NewClient(socketAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	assert.NoError(err)
+	client := api.NewGoBgpServiceClient(conn)
+
+	peer1 := &api.Peer{
+		Conf: &api.PeerConf{
+			NeighborAddress: "127.0.0.1",
+			PeerAsn:         2,
+		},
+		Transport: &api.Transport{
+			PassiveMode: true,
+		},
+	}
+	err = s.AddPeer(context.Background(), &api.AddPeerRequest{Peer: peer1})
+	assert.NoError(err)
+
+	d1 := &api.DefinedSet{
+		DefinedType: api.DefinedType_DEFINED_TYPE_PREFIX,
+		Name:        "d1",
+		Prefixes: []*api.Prefix{
+			{
+				IpPrefix:      "10.1.0.0/24",
+				MaskLengthMax: 24,
+				MaskLengthMin: 24,
+			},
+		},
+	}
+	s1 := &api.Statement{
+		Name: "s1",
+		Conditions: &api.Conditions{
+			PrefixSet: &api.MatchSet{
+				Name: "d1",
+				Type: api.MatchSet_TYPE_ANY,
+			},
+		},
+		Actions: &api.Actions{
+			RouteAction: api.RouteAction_ROUTE_ACTION_REJECT,
+		},
+	}
+	err = s.AddDefinedSet(context.Background(), &api.AddDefinedSetRequest{DefinedSet: d1})
+	assert.NoError(err)
+	p1 := &api.Policy{
+		Name:       "p1",
+		Statements: []*api.Statement{s1},
+	}
+	err = s.AddPolicy(context.Background(), &api.AddPolicyRequest{Policy: p1})
+	assert.NoError(err)
+	err = s.AddPolicyAssignment(context.Background(), &api.AddPolicyAssignmentRequest{
+		Assignment: &api.PolicyAssignment{
+			Name:          table.GLOBAL_RIB_NAME,
+			Direction:     api.PolicyDirection_POLICY_DIRECTION_IMPORT,
+			Policies:      []*api.Policy{p1},
+			DefaultAction: api.RouteAction_ROUTE_ACTION_ACCEPT,
+		},
+	})
+	assert.NoError(err)
+
+	t2 := NewBgpServer()
+	go t2.Serve()
+	err = t2.StartBgp(context.Background(), &api.StartBgpRequest{
+		Global: &api.Global{
+			Asn:        2,
+			RouterId:   "2.2.2.2",
+			ListenPort: -1,
+		},
+	})
+	assert.NoError(err)
+	defer t2.StopBgp(context.Background(), &api.StopBgpRequest{})
+
+	family := &api.Family{
+		Afi:  api.Family_AFI_IP,
+		Safi: api.Family_SAFI_UNICAST,
+	}
+
+	nlri1 := &api.NLRI{Nlri: &api.NLRI_Prefix{Prefix: &api.IPAddressPrefix{
+		Prefix:    "10.1.0.0",
+		PrefixLen: 24,
+	}}}
+
+	attrs := []*api.Attribute{
+		{
+			Attr: &api.Attribute_Origin{Origin: &api.OriginAttribute{
+				Origin: 0,
+			}},
+		},
+		{
+			Attr: &api.Attribute_NextHop{NextHop: &api.NextHopAttribute{
+				NextHop: "10.0.0.1",
+			}},
+		},
+	}
+
+	_, err = t2.AddPath(apiutil.AddPathRequest{
+		Paths: []*apiutil.Path{
+			mustApi2apiutilPath(&api.Path{
+				Family: family,
+				Nlri:   nlri1,
+				Pattrs: attrs,
+			}),
+		},
+	})
+
+	assert.NoError(err)
+
+	nlri2 := &api.NLRI{Nlri: &api.NLRI_Prefix{Prefix: &api.IPAddressPrefix{
+		Prefix:    "10.2.0.0",
+		PrefixLen: 24,
+	}}}
+	_, err = t2.AddPath(apiutil.AddPathRequest{
+		Paths: []*apiutil.Path{
+			mustApi2apiutilPath(&api.Path{
+				Family: family,
+				Nlri:   nlri2,
+				Pattrs: attrs,
+			}),
+		},
+	})
+
+	assert.NoError(err)
+
+	peer2 := &api.Peer{
+		Conf: &api.PeerConf{
+			NeighborAddress: "127.0.0.1",
+			PeerAsn:         1,
+		},
+		Transport: &api.Transport{
+			RemotePort: 10179,
+		},
+		Timers: &api.Timers{
+			Config: &api.TimersConfig{
+				ConnectRetry:           1,
+				IdleHoldTimeAfterReset: 1,
+			},
+		},
+		AfiSafis: []*api.AfiSafi{
+			{
+				Config: &api.AfiSafiConfig{
+					Family: &api.Family{
+						Afi:  api.Family_AFI_IP,
+						Safi: api.Family_SAFI_UNICAST,
+					},
+				},
+			},
+			{
+				Config: &api.AfiSafiConfig{
+					Family: &api.Family{
+						Afi:  api.Family_AFI_IP6,
+						Safi: api.Family_SAFI_UNICAST,
+					},
+				},
+			},
+		},
+	}
+
+	t.Log("wait for peer1 to be established")
+	establishedWg := GRPCwaitEstablished(t, client, bgp.RF_IPv4_UC, bgp.RF_IPv6_UC)
+	t.Log("wait for peer1 to be established done")
+
+	err = t2.AddPeer(context.Background(), &api.AddPeerRequest{Peer: peer2})
+	assert.NoError(err)
+	t.Log("t2 add peer done")
+
+	establishedWg.Wait()
+	t.Log("t2 peer established done")
+
+	count := 0
+	tableCh := make(chan any)
+	watchCtx, watchCancel := context.WithCancel(context.Background())
+	resp, err := client.WatchEvent(watchCtx, &api.WatchEventRequest{
+		Table: &api.WatchEventRequest_Table{
+			Filters: []*api.WatchEventRequest_Table_Filter{
+				{
+					Type:        api.WatchEventRequest_Table_Filter_TYPE_ADJIN,
+					PeerAddress: "127.0.0.1",
+					Init:        true,
+				},
+			},
+		},
+	})
+	assert.NoError(err, "failed to start watch event")
+
+	go func() {
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			default:
+				r, err := resp.Recv()
+				assert.NoError(err, "failed to receive watch event response")
+				t := r.Event.(*api.WatchEventResponse_Table)
+				count += len(t.Table.Paths)
+				if count == 2 {
+					watchCancel()
+					close(tableCh)
+				}
+			}
+		}
+	}()
+	assert.NoError(err)
+	<-tableCh
+
+	assert.Equal(2, count)
+}
+
+func TestGRPCAddPathUpdatesUUIDMap(t *testing.T) {
+	assert := assert.New(t)
+
+	socketName, err := os.MkdirTemp("", "gobgp-grpc-test-*")
+	assert.NoError(err)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(socketName)
+	})
+	socketAddr := "unix://" + socketName + "/gobgp.sock"
+
+	s := NewBgpServer(GrpcListenAddress(socketAddr))
+	go s.Serve()
+	defer s.Stop()
+
+	err = s.StartBgp(context.Background(), &api.StartBgpRequest{
+		Global: &api.Global{
+			Asn:        1,
+			RouterId:   "1.1.1.1",
+			ListenPort: -1,
+		},
+	})
+	assert.NoError(err)
+	if err != nil {
+		return
+	}
+	waitGRPCSocket(t, socketAddr)
+
+	conn, err := grpc.NewClient(socketAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	assert.NoError(err)
+	if err != nil {
+		return
+	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+	client := api.NewGoBgpServiceClient(conn)
+
+	prefix, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	assert.NoError(err)
+	nh, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("10.0.0.1"))
+	assert.NoError(err)
+	origin := bgp.NewPathAttributeOrigin(0)
+
+	path := &api.Path{
+		Family: &api.Family{
+			Afi:  api.Family_AFI_IP,
+			Safi: api.Family_SAFI_UNICAST,
+		},
+		Nlri:   nlri(prefix),
+		Pattrs: attrs([]bgp.PathAttributeInterface{origin, nh}),
+	}
+
+	resp, err := client.AddPath(context.Background(), &api.AddPathRequest{
+		TableType: api.TableType_TABLE_TYPE_GLOBAL,
+		Path:      path,
+	})
+	assert.NoError(err)
+	if err != nil {
+		return
+	}
+
+	id, err := uuid.FromBytes(resp.Uuid)
+	assert.NoError(err)
+	assert.Len(s.uuidMap, 1)
+	for _, v := range s.uuidMap {
+		assert.Equal(id, v)
+	}
+}
+
+// A FlowSpec route has no next hop. AddPath (apiutil2Path) and AddPathStream
+// (api2Path) must both accept it.
+func TestApi2PathFlowSpecWithoutNexthop(t *testing.T) {
+	prefix4, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	require.NoError(t, err)
+	prefix6, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("2001:db8::/64"))
+	require.NoError(t, err)
+	rd, err := bgp.ParseRouteDistinguisher("100:100")
+	require.NoError(t, err)
+
+	fs4, err := bgp.NewFlowSpecUnicast(bgp.RF_FS_IPv4_UC, []bgp.FlowSpecComponentInterface{bgp.NewFlowSpecDestinationPrefix(prefix4)})
+	require.NoError(t, err)
+	fs6, err := bgp.NewFlowSpecUnicast(bgp.RF_FS_IPv6_UC, []bgp.FlowSpecComponentInterface{bgp.NewFlowSpecDestinationPrefix6(prefix6, 0)})
+	require.NoError(t, err)
+	fs4vpn, err := bgp.NewFlowSpecVPN(bgp.RF_FS_IPv4_VPN, rd, []bgp.FlowSpecComponentInterface{bgp.NewFlowSpecDestinationPrefix(prefix4)})
+	require.NoError(t, err)
+
+	tests := []struct {
+		name   string
+		family bgp.Family
+		nlri   bgp.NLRI
+	}{
+		{"ipv4 flowspec", bgp.RF_FS_IPv4_UC, fs4},
+		{"ipv6 flowspec", bgp.RF_FS_IPv6_UC, fs6},
+		{"ipv4 flowspec vpn", bgp.RF_FS_IPv4_VPN, fs4vpn},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mpreach, err := bgp.NewPathAttributeMpReachNLRI(tt.family, []bgp.PathNLRI{{NLRI: tt.nlri}})
+			require.NoError(t, err)
+			path := &api.Path{
+				Family: apiutil.ToApiFamily(tt.family.Afi(), tt.family.Safi()),
+				Nlri:   nlri(tt.nlri),
+				Pattrs: attrs([]bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0), mpreach}),
+			}
+
+			p, err := api2Path(api.TableType_TABLE_TYPE_GLOBAL, path)
+			require.NoError(t, err, "api2Path")
+			assert.Equal(t, tt.family, p.GetFamily())
+			assert.False(t, p.GetNexthop().IsValid())
+
+			p, err = apiutil2Path(mustApi2apiutilPath(path), false)
+			require.NoError(t, err, "apiutil2Path")
+			assert.Equal(t, tt.family, p.GetFamily())
+			assert.False(t, p.GetNexthop().IsValid())
+		})
+	}
+}
+
+// AddPath (apiutil2Path) and AddPathStream (api2Path) take the source
+// address of a path from neighbor_ip, and take its timestamp from age, or
+// use the current time when age is not set.
+func TestApi2PathSourceAndAge(t *testing.T) {
+	prefix, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	require.NoError(t, err)
+	nh, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.1"))
+	require.NoError(t, err)
+	newPath := func() *api.Path {
+		return &api.Path{
+			Family: apiutil.ToApiFamily(bgp.AFI_IP, bgp.SAFI_UNICAST),
+			Nlri:   nlri(prefix),
+			Pattrs: attrs([]bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0), nh}),
+		}
+	}
+
+	for _, conv := range []struct {
+		name string
+		fn   func(*api.Path) (*table.Path, error)
+	}{
+		{"apiutil2Path", func(p *api.Path) (*table.Path, error) { return apiutil2Path(mustApi2apiutilPath(p), false) }},
+		{"api2Path", func(p *api.Path) (*table.Path, error) { return api2Path(api.TableType_TABLE_TYPE_GLOBAL, p) }},
+	} {
+		t.Run(conv.name, func(t *testing.T) {
+			age := time.Unix(1700000000, 0)
+			path := newPath()
+			path.SourceAsn = 65001
+			path.SourceId = "10.0.0.2"
+			path.NeighborIp = "10.0.0.3"
+			path.Age = tspb.New(age)
+			p, err := conv.fn(path)
+			require.NoError(t, err)
+			assert.Equal(t, netip.MustParseAddr("10.0.0.3"), p.GetSource().Address)
+			assert.False(t, p.IsLocal())
+			assert.Equal(t, age, p.GetTimestamp())
+
+			before := time.Now().Truncate(time.Second)
+			p, err = conv.fn(newPath())
+			require.NoError(t, err)
+			assert.True(t, p.IsLocal())
+			assert.False(t, p.GetTimestamp().Before(before), "timestamp %s", p.GetTimestamp())
+		})
+	}
+}
+
+func TestToOcAttributeComparison(t *testing.T) {
+	tests := []struct {
+		in   api.Comparison
+		want oc.AttributeComparison
+	}{
+		{api.Comparison_COMPARISON_EQ, oc.ATTRIBUTE_COMPARISON_EQ},
+		{api.Comparison_COMPARISON_GE, oc.ATTRIBUTE_COMPARISON_GE},
+		{api.Comparison_COMPARISON_LE, oc.ATTRIBUTE_COMPARISON_LE},
+	}
+	for _, tt := range tests {
+		if got := toOcAttributeComparison(tt.in); got != tt.want {
+			t.Fatalf("toOcAttributeComparison(%v) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestNewAsPathLengthConditionFromApiStruct(t *testing.T) {
+	tests := []struct {
+		inType api.Comparison
+		inVal  uint32
+		wantOp string
+	}{
+		{api.Comparison_COMPARISON_EQ, 1, "="},
+		{api.Comparison_COMPARISON_GE, 2, ">="},
+		{api.Comparison_COMPARISON_LE, 3, "<="},
+	}
+	for _, tt := range tests {
+		cond, err := newAsPathLengthConditionFromApiStruct(&api.AsPathLength{Type: tt.inType, Length: tt.inVal})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cond == nil {
+			t.Fatalf("condition is nil")
+		}
+		got := cond.String()
+		if got[:len(tt.wantOp)] != tt.wantOp {
+			t.Fatalf("operator mismatch: got %q want prefix %q", got, tt.wantOp)
+		}
+	}
+}
+
+func TestNewCommunityCountConditionFromApiStruct(t *testing.T) {
+	tests := []struct {
+		inType api.Comparison
+		inVal  uint32
+		wantOp string
+	}{
+		{api.Comparison_COMPARISON_EQ, 10, "="},
+		{api.Comparison_COMPARISON_GE, 20, ">="},
+		{api.Comparison_COMPARISON_LE, 30, "<="},
+	}
+	for _, tt := range tests {
+		cond, err := newCommunityCountConditionFromApiStruct(&api.CommunityCount{Type: tt.inType, Count: tt.inVal})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cond == nil {
+			t.Fatalf("condition is nil")
+		}
+		got := cond.String()
+		if got[:len(tt.wantOp)] != tt.wantOp {
+			t.Fatalf("operator mismatch: got %q want prefix %q", got, tt.wantOp)
+		}
+	}
+}
+
+func TestNewConfigPrefixFromAPIStruct(t *testing.T) {
+	c, err := newConfigPrefixFromAPIStruct(&api.Prefix{IpPrefix: "10.1.2.3/24", MaskLengthMin: 24, MaskLengthMax: 24})
+	assert.NoError(t, err)
+	assert.Equal(t, "10.1.2.3/24", c.IpPrefix.String())
+	assert.Equal(t, "", c.RtcPrefix)
+	assert.Equal(t, "24..24", c.MasklengthRange)
+
+	// rtc-prefix is canonicalized (dotted AS -> asplain, /0 -> 0:0:0/0).
+	c, err = newConfigPrefixFromAPIStruct(&api.Prefix{RtcPrefix: "100.1000:65000:100/80", MaskLengthMin: 80, MaskLengthMax: 80})
+	assert.NoError(t, err)
+	assert.Equal(t, "6554600:65000:100/80", c.RtcPrefix)
+	assert.False(t, c.IpPrefix.IsValid())
+
+	// A length-less rtc-prefix is accepted on input and canonicalized to /96.
+	c, err = newConfigPrefixFromAPIStruct(&api.Prefix{RtcPrefix: "65000:65000:100", MaskLengthMin: 96, MaskLengthMax: 96})
+	assert.NoError(t, err)
+	assert.Equal(t, "65000:65000:100/96", c.RtcPrefix)
+
+	// /0 wildcard (RTC default-route) keeps the caller's mask range.
+	c, err = newConfigPrefixFromAPIStruct(&api.Prefix{RtcPrefix: "0:0:0/0", MaskLengthMin: 0, MaskLengthMax: 96})
+	assert.NoError(t, err)
+	assert.Equal(t, "0:0:0/0", c.RtcPrefix)
+	assert.False(t, c.IpPrefix.IsValid())
+	assert.Equal(t, "0..96", c.MasklengthRange)
+	c, err = newConfigPrefixFromAPIStruct(&api.Prefix{RtcPrefix: "0:0/0", MaskLengthMin: 0, MaskLengthMax: 0})
+	assert.NoError(t, err)
+	assert.Equal(t, "0:0:0/0", c.RtcPrefix)
+
+	_, err = newConfigPrefixFromAPIStruct(&api.Prefix{IpPrefix: "10.0.0.0/8", RtcPrefix: "65000:65000:100/96"})
+	assert.NotNil(t, err)
+	_, err = newConfigPrefixFromAPIStruct(&api.Prefix{})
+	assert.NotNil(t, err)
+	_, err = newConfigPrefixFromAPIStruct(&api.Prefix{RtcPrefix: "65000:65000"})
+	assert.NotNil(t, err)
+}
+
+func TestNewPrefixFromApiStructRTC(t *testing.T) {
+	p, err := newPrefixFromApiStruct(&api.Prefix{RtcPrefix: "65000:65000:100/96", MaskLengthMin: 96, MaskLengthMax: 96})
+	assert.NoError(t, err)
+	assert.Equal(t, bgp.RF_RTC_UC, p.AddressFamily)
+	assert.Equal(t, uint8(96), p.MasklengthRangeMin)
+	assert.Equal(t, uint8(96), p.MasklengthRangeMax)
+	assert.Equal(t, "65000:65000:100/96", p.PrefixString())
+
+	// /0 wildcard maps to ::/0 and matches any RTC NLRI.
+	p, err = newPrefixFromApiStruct(&api.Prefix{RtcPrefix: "0:0:0/0", MaskLengthMin: 0, MaskLengthMax: 96})
+	assert.NoError(t, err)
+	assert.Equal(t, bgp.RF_RTC_UC, p.AddressFamily)
+	assert.Equal(t, uint8(0), p.MasklengthRangeMin)
+	assert.Equal(t, uint8(96), p.MasklengthRangeMax)
+	assert.Equal(t, "::/0", p.Prefix.String())
+	assert.Equal(t, "0:0:0/0", p.PrefixString())
+	full, err := newPrefixFromApiStruct(&api.Prefix{RtcPrefix: "65000:65000:100/96", MaskLengthMin: 96, MaskLengthMax: 96})
+	assert.NoError(t, err)
+	assert.True(t, p.Prefix.Contains(full.Prefix.Addr()))
+}
+
+func TestNewNeighborSetFromApiStructZone(t *testing.T) {
+	ds, err := newDefinedSetFromApiStruct(&api.DefinedSet{
+		DefinedType: api.DefinedType_DEFINED_TYPE_NEIGHBOR,
+		Name:        "ns1",
+		List:        []string{"10.0.0.1/32", "fe80::1%eth0", "fe80::2%eth1/128"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"10.0.0.1/32", "fe80::1%eth0/128", "fe80::2%eth1/128"}, ds.List())
+
+	_, err = newDefinedSetFromApiStruct(&api.DefinedSet{
+		DefinedType: api.DefinedType_DEFINED_TYPE_NEIGHBOR,
+		Name:        "ns1",
+		List:        []string{"2001:db8::1%eth0"},
+	})
+	assert.Error(t, err)
+}
+
+// A peer event for a session that has not come up carries no router ID. The
+// field must be an empty string, not the zero netip.Addr's "invalid IP" text.
+func TestGRPCWatchEventPeerUnsetAddresses(t *testing.T) {
+	dir, err := os.MkdirTemp("", "gobgp-grpc-test-*")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(dir)
+	})
+	socketAddr := "unix://" + dir + "/gobgp.sock"
+
+	s := NewBgpServer(GrpcListenAddress(socketAddr))
+	go s.Serve()
+	defer s.Stop()
+
+	err = s.StartBgp(context.Background(), &api.StartBgpRequest{
+		Global: &api.Global{
+			Asn:        1,
+			RouterId:   "1.1.1.1",
+			ListenPort: -1,
+		},
+	})
+	require.NoError(t, err)
+	waitGRPCSocket(t, socketAddr)
+
+	conn, err := grpc.NewClient(socketAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	client := api.NewGoBgpServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := client.WatchEvent(ctx, &api.WatchEventRequest{Peer: &api.WatchEventRequest_Peer{}})
+	require.NoError(t, err)
+
+	// 192.0.2.1 is TEST-NET-1, so the session never comes up and the peer
+	// has no remote router ID.
+	err = s.AddPeer(context.Background(), &api.AddPeerRequest{Peer: &api.Peer{
+		Conf: &api.PeerConf{NeighborAddress: "192.0.2.1", PeerAsn: 65001, Description: "test peer"},
+	}})
+	require.NoError(t, err)
+
+	for {
+		r, err := stream.Recv()
+		require.NoError(t, err)
+		p := r.GetPeer()
+		if p == nil || p.Peer.GetConf().GetNeighborAddress() != "192.0.2.1" {
+			continue
+		}
+		assert.Equal(t, "", p.Peer.GetState().GetRouterId(), "state.router_id")
+		assert.Equal(t, "test peer", p.Peer.GetConf().GetDescription(), "conf.description")
+		assert.NotEqual(t, api.PeerState_SESSION_STATE_ESTABLISHED, p.Peer.GetState().GetSessionState())
+		return
+	}
+}
+
+// ListStatement must report the type of every set-community action as it was
+// given. The oc option and the API enum use different numbers, so a cast
+// between them is off by one.
+func TestGRPCListStatementCommunityActionType(t *testing.T) {
+	s := NewBgpServer()
+	go s.Serve()
+	err := s.StartBgp(context.Background(), &api.StartBgpRequest{
+		Global: &api.Global{
+			Asn:        1,
+			RouterId:   "1.1.1.1",
+			ListenPort: -1,
+		},
+	})
+	require.NoError(t, err)
+	defer s.StopBgp(context.Background(), &api.StopBgpRequest{})
+
+	types := []api.CommunityAction_Type{
+		api.CommunityAction_TYPE_ADD,
+		api.CommunityAction_TYPE_REMOVE,
+		api.CommunityAction_TYPE_REPLACE,
+	}
+	for _, typ := range types {
+		t.Run(typ.String(), func(t *testing.T) {
+			name := "st-" + typ.String()
+			err := s.AddStatement(context.Background(), &api.AddStatementRequest{
+				Statement: &api.Statement{
+					Name: name,
+					Actions: &api.Actions{
+						RouteAction:    api.RouteAction_ROUTE_ACTION_ACCEPT,
+						Community:      &api.CommunityAction{Type: typ, Communities: []string{"65100:10"}},
+						ExtCommunity:   &api.CommunityAction{Type: typ, Communities: []string{"rt:65100:10"}},
+						LargeCommunity: &api.CommunityAction{Type: typ, Communities: []string{"65100:10:20"}},
+					},
+				},
+			})
+			require.NoError(t, err)
+
+			var listed []*api.Statement
+			err = s.ListStatement(context.Background(), &api.ListStatementRequest{Name: name}, func(st *api.Statement) {
+				listed = append(listed, st)
+			})
+			require.NoError(t, err)
+			require.Len(t, listed, 1)
+			actions := listed[0].GetActions()
+			assert.Equal(t, typ, actions.GetCommunity().GetType(), "community")
+			assert.Equal(t, typ, actions.GetExtCommunity().GetType(), "ext-community")
+			assert.Equal(t, typ, actions.GetLargeCommunity().GetType(), "large-community")
+		})
+	}
+}
+
+// A set-community action must reject a community that is not
+// <0..65535>:<0..65535> instead of storing a different one.
+func TestGRPCAddStatementInvalidCommunity(t *testing.T) {
+	s := NewBgpServer()
+	go s.Serve()
+	err := s.StartBgp(context.Background(), &api.StartBgpRequest{
+		Global: &api.Global{
+			Asn:        1,
+			RouterId:   "1.1.1.1",
+			ListenPort: -1,
+		},
+	})
+	require.NoError(t, err)
+	defer s.StopBgp(context.Background(), &api.StopBgpRequest{})
+
+	for i, c := range []string{"70000:1", "65000:70000", "65000:1:2"} {
+		t.Run(c, func(t *testing.T) {
+			name := fmt.Sprintf("st%d", i)
+			err := s.AddStatement(context.Background(), &api.AddStatementRequest{
+				Statement: &api.Statement{
+					Name: name,
+					Actions: &api.Actions{
+						RouteAction: api.RouteAction_ROUTE_ACTION_ACCEPT,
+						Community:   &api.CommunityAction{Type: api.CommunityAction_TYPE_ADD, Communities: []string{c}},
+					},
+				},
+			})
+			if err == nil {
+				err = s.ListStatement(context.Background(), &api.ListStatementRequest{Name: name}, func(st *api.Statement) {
+					t.Errorf("%q was accepted as %v", c, st.GetActions().GetCommunity().GetCommunities())
+				})
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// ListPolicy and ListStatement must describe the same statement the same way.
+// They used to have a converter each, and the two drifted apart.
+func TestGRPCListPolicyAndListStatementAgree(t *testing.T) {
+	s := NewBgpServer()
+	go s.Serve()
+	ctx := context.Background()
+	err := s.StartBgp(ctx, &api.StartBgpRequest{
+		Global: &api.Global{
+			Asn:        1,
+			RouterId:   "1.1.1.1",
+			ListenPort: -1,
+		},
+	})
+	require.NoError(t, err)
+	defer s.StopBgp(ctx, &api.StopBgpRequest{})
+
+	sets := []*api.DefinedSet{
+		{DefinedType: api.DefinedType_DEFINED_TYPE_PREFIX, Name: "ps1", Prefixes: []*api.Prefix{{IpPrefix: "10.0.0.0/8", MaskLengthMin: 8, MaskLengthMax: 32}}},
+		{DefinedType: api.DefinedType_DEFINED_TYPE_NEIGHBOR, Name: "ns1", List: []string{"10.0.0.1/32"}},
+		{DefinedType: api.DefinedType_DEFINED_TYPE_AS_PATH, Name: "as1", List: []string{"^65100"}},
+		{DefinedType: api.DefinedType_DEFINED_TYPE_COMMUNITY, Name: "cs1", List: []string{"65100:10"}},
+		{DefinedType: api.DefinedType_DEFINED_TYPE_EXT_COMMUNITY, Name: "es1", List: []string{"rt:65100:10"}},
+		{DefinedType: api.DefinedType_DEFINED_TYPE_LARGE_COMMUNITY, Name: "ls1", List: []string{"65100:10:20"}},
+	}
+	for _, ds := range sets {
+		require.NoError(t, s.AddDefinedSet(ctx, &api.AddDefinedSetRequest{DefinedSet: ds}))
+	}
+
+	statements := []*api.Statement{
+		{
+			// Every condition and every action at once.
+			Name: "full",
+			Conditions: &api.Conditions{
+				PrefixSet:         &api.MatchSet{Type: api.MatchSet_TYPE_ANY, Name: "ps1"},
+				NeighborSet:       &api.MatchSet{Type: api.MatchSet_TYPE_INVERT, Name: "ns1"},
+				AsPathLength:      &api.AsPathLength{Length: 5, Type: api.Comparison_COMPARISON_GE},
+				AsPathSet:         &api.MatchSet{Type: api.MatchSet_TYPE_ALL, Name: "as1"},
+				CommunitySet:      &api.MatchSet{Type: api.MatchSet_TYPE_ALL, Name: "cs1"},
+				ExtCommunitySet:   &api.MatchSet{Type: api.MatchSet_TYPE_ANY, Name: "es1"},
+				LargeCommunitySet: &api.MatchSet{Type: api.MatchSet_TYPE_INVERT, Name: "ls1"},
+				RpkiResult:        api.ValidationState_VALIDATION_STATE_VALID,
+				RouteType:         api.Conditions_ROUTE_TYPE_EXTERNAL,
+				NextHopInList:     []string{"10.0.0.1"},
+				AfiSafiIn:         []*api.Family{{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_UNICAST}},
+				CommunityCount:    &api.CommunityCount{Count: 3, Type: api.Comparison_COMPARISON_LE},
+				Origin:            api.OriginType_ORIGIN_TYPE_EGP,
+				LocalPrefEq:       &api.LocalPrefEq{Value: 111},
+				MedEq:             &api.MedEq{Value: 222},
+			},
+			Actions: &api.Actions{
+				RouteAction:    api.RouteAction_ROUTE_ACTION_ACCEPT,
+				Community:      &api.CommunityAction{Type: api.CommunityAction_TYPE_ADD, Communities: []string{"65100:10"}},
+				Med:            &api.MedAction{Type: api.MedAction_TYPE_MOD, Value: -50},
+				AsPrepend:      &api.AsPrependAction{Asn: 65100, Repeat: 3},
+				ExtCommunity:   &api.CommunityAction{Type: api.CommunityAction_TYPE_REMOVE, Communities: []string{"rt:65100:10"}},
+				Nexthop:        &api.NexthopAction{Self: true},
+				LocalPref:      &api.LocalPrefAction{Value: 444},
+				LargeCommunity: &api.CommunityAction{Type: api.CommunityAction_TYPE_REPLACE, Communities: []string{"65100:10:20"}},
+				OriginAction:   &api.OriginAction{Origin: api.OriginType_ORIGIN_TYPE_INCOMPLETE},
+			},
+		},
+		{
+			// A replace with no communities clears them. It is an action,
+			// not the absence of one.
+			Name: "empty-replace",
+			Actions: &api.Actions{
+				RouteAction: api.RouteAction_ROUTE_ACTION_REJECT,
+				Community:   &api.CommunityAction{Type: api.CommunityAction_TYPE_REPLACE},
+			},
+		},
+	}
+	err = s.AddPolicy(ctx, &api.AddPolicyRequest{
+		Policy: &api.Policy{Name: "p1", Statements: statements},
+	})
+	require.NoError(t, err)
+
+	var policies []*api.Policy
+	err = s.ListPolicy(ctx, &api.ListPolicyRequest{Name: "p1"}, func(p *api.Policy) {
+		policies = append(policies, p)
+	})
+	require.NoError(t, err)
+	require.Len(t, policies, 1)
+	require.Len(t, policies[0].Statements, len(statements))
+
+	for _, want := range policies[0].Statements {
+		var got []*api.Statement
+		err = s.ListStatement(ctx, &api.ListStatementRequest{Name: want.Name}, func(st *api.Statement) {
+			got = append(got, st)
+		})
+		require.NoError(t, err)
+		require.Len(t, got, 1, want.Name)
+		if !proto.Equal(want, got[0]) {
+			t.Errorf("statement %s differs\nListPolicy:    %v\nListStatement: %v",
+				want.Name, want, got[0])
+		}
+	}
+
+	// The clearing action must survive, not be reported as no action at all.
+	for _, st := range policies[0].Statements {
+		if st.Name == "empty-replace" {
+			assert.Equal(t, api.CommunityAction_TYPE_REPLACE, st.GetActions().GetCommunity().GetType())
+		}
+	}
+}
+
+// watchTableEvents starts a WatchEvent whose consumer is held until release is
+// closed, so that the events are read well after they are queued. It returns
+// what the consumer received.
+func watchTableEvents(t *testing.T, s *BgpServer, filters []*api.WatchEventRequest_Table_Filter, release <-chan struct{}) <-chan watchedTableEvent {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ch := make(chan watchedTableEvent, 64)
+	// watchEvent registers the watcher and returns, with a status that says
+	// the watch started.
+	err := (&server{bgpServer: s, shared: s.shared}).watchEvent(ctx, &api.WatchEventRequest{
+		Table: &api.WatchEventRequest_Table{Filters: filters},
+	}, func(resp *api.WatchEventResponse, _ time.Time) {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return
+		}
+		ch <- watchedTableEvent{table: resp.GetTable(), readAt: time.Now()}
+	})
+	require.Equal(t, codes.OK, status.Code(err))
+	return ch
+}
+
+type watchedTableEvent struct {
+	table  *api.WatchEventResponse_TableEvent
+	readAt time.Time
+}
+
+func startWatchTestServer(t *testing.T) *BgpServer {
+	t.Helper()
+	s := NewBgpServer()
+	go s.Serve()
+	t.Cleanup(s.Stop)
+	require.NoError(t, s.StartBgp(context.Background(), &api.StartBgpRequest{
+		Global: &api.Global{Asn: 1, RouterId: "1.1.1.1", ListenPort: -1},
+	}))
+	return s
+}
+
+func addWatchTestPath(t *testing.T, s *BgpServer, prefix string) {
+	t.Helper()
+	nh, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.1"))
+	require.NoError(t, err)
+	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix(prefix))
+	require.NoError(t, err)
+	_, err = s.AddPath(apiutil.AddPathRequest{Paths: []*apiutil.Path{{
+		Family: bgp.RF_IPv4_UC,
+		Nlri:   nlri,
+		Attrs:  []bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0), nh},
+	}}})
+	require.NoError(t, err)
+}
+
+// A consumer of WatchEvent tells how late it reads from the timestamp of a
+// table event, so it has to be the time the event was queued for the watcher,
+// whatever the type of the event and whatever time the event itself carries.
+func TestGRPCWatchEventTableTimestampIsQueueTime(t *testing.T) {
+	s := startWatchTestServer(t)
+	release := make(chan struct{})
+	ch := watchTableEvents(t, s, []*api.WatchEventRequest_Table_Filter{
+		{Type: api.WatchEventRequest_Table_Filter_TYPE_BEST},
+		{Type: api.WatchEventRequest_Table_Filter_TYPE_ADJIN},
+		{Type: api.WatchEventRequest_Table_Filter_TYPE_POST_POLICY},
+		{Type: api.WatchEventRequest_Table_Filter_TYPE_EOR},
+	}, release)
+
+	// The events the server queues carry times of their own: the receipt of
+	// the UPDATE, the time of the path, or none. Make them all older than the
+	// queueing.
+	old := time.Now().Add(-time.Hour)
+	peer := &table.PeerInfo{
+		AS:      65001,
+		Address: netip.MustParseAddr("192.0.2.2"),
+		ID:      netip.MustParseAddr("192.0.2.2"),
+		LocalID: netip.MustParseAddr("1.1.1.1"),
+	}
+	nh, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.2"))
+	require.NoError(t, err)
+	newPath := func(prefix string) []*table.Path {
+		nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix(prefix))
+		require.NoError(t, err)
+		return []*table.Path{table.NewPath(bgp.RF_IPv4_UC, peer, bgp.PathNLRI{NLRI: nlri}, false,
+			[]bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0), nh}, old, false)}
+	}
+
+	queuedAfter := time.Now()
+	addWatchTestPath(t, s, "10.1.0.0/24") // best path
+	s.notifyWatcher(watchEventTypePreUpdate, &watchEventUpdate{
+		Timestamp: old, PeerAS: peer.AS, PeerAddress: peer.Address, PeerID: peer.ID,
+		PathList: newPath("10.2.0.0/24"),
+	})
+	s.notifyWatcher(watchEventTypePostUpdate, &watchEventUpdate{
+		Timestamp: old, PeerAS: peer.AS, PeerAddress: peer.Address, PeerID: peer.ID,
+		PostPolicy: true, PathList: newPath("10.3.0.0/24"),
+	})
+	s.notifyWatcher(watchEventTypeEor, &watchEventEor{
+		Family: bgp.RF_IPv4_UC, PeerInfo: peer, // no time at all
+	})
+	queuedBefore := time.Now()
+
+	// Read well after the events were queued.
+	time.Sleep(300 * time.Millisecond)
+	close(release)
+
+	seen := make(map[string]bool)
+	deadline := time.After(5 * time.Second)
+	for len(seen) < 4 {
+		select {
+		case r := <-ch:
+			require.NotEmpty(t, r.table.Paths)
+			require.NotNil(t, r.table.Timestamp, "a table event carries a timestamp")
+			require.NoError(t, r.table.Timestamp.CheckValid())
+			ts := r.table.Timestamp.AsTime()
+			key := r.table.Paths[0].String()
+			require.False(t, ts.Before(queuedAfter), "queued before it was: %s, event %s", ts, key)
+			require.False(t, ts.After(queuedBefore), "queued after the last was queued, so not the queue time: %s, event %s", ts, key)
+			require.GreaterOrEqual(t, r.readAt.Sub(ts), 250*time.Millisecond, "the timestamp is the read time: event %s", key)
+			seen[key] = true
+		case <-deadline:
+			t.Fatalf("got %d of 4 events", len(seen))
+		}
+	}
+}
+
+// The events that dump the table when a watch starts are queued at that time,
+// and carry it like the others.
+func TestGRPCWatchEventInitTimestamp(t *testing.T) {
+	s := startWatchTestServer(t)
+	addWatchTestPath(t, s, "10.1.0.0/24")
+	time.Sleep(1100 * time.Millisecond) // the path is older than the watch by more than its resolution
+
+	release := make(chan struct{})
+	queuedAfter := time.Now()
+	ch := watchTableEvents(t, s, []*api.WatchEventRequest_Table_Filter{
+		{Type: api.WatchEventRequest_Table_Filter_TYPE_BEST, Init: true},
+		{Type: api.WatchEventRequest_Table_Filter_TYPE_POST_POLICY, Init: true},
+	}, release)
+	queuedBefore := time.Now()
+	time.Sleep(300 * time.Millisecond)
+	close(release)
+
+	// The best path dump, the post-policy dump and its end-of-RIB marker.
+	for range 3 {
+		select {
+		case r := <-ch:
+			require.NotNil(t, r.table.Timestamp, "an init dump message carries a timestamp")
+			require.NoError(t, r.table.Timestamp.CheckValid())
+			ts := r.table.Timestamp.AsTime()
+			require.False(t, ts.Before(queuedAfter), "queued before the watch started: %s", ts)
+			require.False(t, ts.After(queuedBefore), "queued after the watch started: %s", ts)
+		case <-time.After(5 * time.Second):
+			t.Fatal("no table event")
+		}
+	}
+}
